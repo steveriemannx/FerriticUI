@@ -1,0 +1,1670 @@
+#![allow(
+    // We don't use syntax sugar where it's not necessary.
+    clippy::match_like_matches_macro,
+    // Redundant matching is more explicit.
+    clippy::redundant_pattern_matching,
+    // Explicit lifetimes are often easier to reason about.
+    clippy::needless_lifetimes,
+    // No need for defaults in the internal types.
+    clippy::new_without_default,
+    // Matches are good and extendable, no need to make an exception here.
+    clippy::single_match,
+    // Push commands are more regular than macros.
+    clippy::vec_init_then_push,
+    // This is the land of unsafe.
+    clippy::missing_safety_doc,
+    // Let me decide when it's too many.
+    clippy::too_many_arguments,
+)]
+#![warn(
+    trivial_numeric_casts,
+    unused_extern_crates,
+    //TODO: re-enable. Currently doesn't like "mem::size_of" on newer Rust
+    //unused_qualifications,
+    // We don't match on a reference, unless required.
+    clippy::pattern_type_mismatch,
+)]
+
+pub use naga::{StorageAccess, VectorSize, back::PipelineConstants};
+pub type Transform = mint::RowMatrix3x4<f32>;
+
+/// A geometry transform packed for the active graphics backend.
+///
+/// Convert from [`Transform`] before uploading to
+/// [`AccelerationStructureMesh::transform_data`]. The GPU representation is
+/// backend-specific (column-major on Metal, row-major on Vulkan).
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct AccelerationStructureTransform([f32; 12]);
+
+pub const IDENTITY_TRANSFORM: Transform = mint::RowMatrix3x4 {
+    x: mint::Vector4 {
+        x: 1.0,
+        y: 0.0,
+        z: 0.0,
+        w: 0.0,
+    },
+    y: mint::Vector4 {
+        x: 0.0,
+        y: 1.0,
+        z: 0.0,
+        w: 0.0,
+    },
+    z: mint::Vector4 {
+        x: 0.0,
+        y: 0.0,
+        z: 1.0,
+        w: 0.0,
+    },
+};
+
+pub mod derive;
+#[cfg_attr(
+    all(not(vulkan), not(gles), any(target_os = "ios", target_os = "macos")),
+    path = "metal/mod.rs"
+)]
+#[cfg_attr(
+    all(
+        not(gles),
+        any(
+            vulkan,
+            windows,
+            target_os = "linux",
+            target_os = "android",
+            target_os = "freebsd"
+        )
+    ),
+    path = "vulkan/mod.rs"
+)]
+#[cfg_attr(any(gles, target_arch = "wasm32"), path = "gles/mod.rs")]
+mod hal;
+
+/// Direct3D 12 backend. Phase 0 only exposes device initialization, see
+/// `blade-graphics/etc/d3d12.md`.
+#[cfg(all(windows, feature = "d3d12"))]
+pub mod d3d12;
+
+mod internal;
+mod shader;
+pub mod traits;
+pub mod util;
+pub mod limits {
+    /// Max number of passes inside a command encoder.
+    pub const PASS_COUNT: usize = 1234;
+    /// Max plain data size for a pipeline.
+    pub const PLAIN_DATA_SIZE: u32 = 256;
+    /// Implementation ceiling for bindings in one group. Device limits also apply.
+    /// Vulkan tracks inline uniform bindings in a 64-bit mask.
+    pub const RESOURCES_IN_GROUP: u32 = u64::BITS;
+    /// Min storage buffer alignment.
+    pub const STORAGE_BUFFER_ALIGNMENT: u64 = 16;
+    /// Min acceleration structure scratch buffer alignment.
+    pub const ACCELERATION_STRUCTURE_SCRATCH_ALIGNMENT: u64 = 256;
+}
+
+pub use hal::*;
+
+#[cfg(target_arch = "wasm32")]
+pub const CANVAS_ID: &str = "blade";
+
+use std::{fmt, num::NonZeroU32};
+
+/// Error from the underlying graphics platform during initialization.
+#[derive(Debug)]
+pub struct PlatformError(String);
+
+// Up to the backend to use them or not
+#[allow(unused)]
+impl PlatformError {
+    pub fn loading(err: impl fmt::Debug) -> Self {
+        Self(format!("failed to load: {:?}", err))
+    }
+    pub fn init(err: impl fmt::Debug) -> Self {
+        Self(format!("failed to initialize: {:?}", err))
+    }
+}
+
+impl fmt::Display for PlatformError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for PlatformError {}
+
+#[cfg(not(any(
+    vulkan,
+    windows,
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd"
+)))]
+pub mod openxr {
+    #[derive(Clone, Debug)]
+    pub enum Instance {}
+    #[derive(Clone, Debug)]
+    pub enum SystemId {}
+}
+
+#[derive(Clone)]
+pub struct XrDesc {
+    pub instance: openxr::Instance,
+    pub system_id: openxr::SystemId,
+}
+
+impl fmt::Debug for XrDesc {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("XrDesc")
+            .field("system_id", &self.system_id)
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ContextDesc {
+    /// Ability to present contents to a window.
+    pub presentation: bool,
+    /// Enable VR/AR.
+    pub xr: Option<XrDesc>,
+    /// Enable ray tracing support (acceleration structures and ray queries).
+    pub ray_tracing: bool,
+    /// Enable validation of the GAPI, shaders,
+    /// and insert crash markers into command buffers.
+    pub validation: bool,
+    /// Enable GPU timing of all passes.
+    ///
+    /// Panics at context init if the device cannot timestamp.
+    /// Each boundary sample uses the source stage of the barrier recorded
+    /// there, so the timestamp matches the completion that releases the next
+    /// pass. A pass with no preceding barrier is sampled at `TOP_OF_PIPE`.
+    pub timing: bool,
+    /// Enable capture support with GAPI tools and collection of available
+    /// compute-pipeline compiler statistics.
+    ///
+    /// On Vulkan this may disable pipeline caching or increase pipeline creation
+    /// time, so applications should normally enable it only for profiling.
+    pub capture: bool,
+    /// Enable GAPI overlay.
+    pub overlay: bool,
+    /// Request a low system-wide queue priority where supported.
+    ///
+    /// Currently maps to `VK_QUEUE_GLOBAL_PRIORITY_LOW_KHR` on Vulkan when the
+    /// selected queue family advertises it, and to a utility-QoS Metal command
+    /// queue when the driver exposes that. Other backends and drivers without
+    /// support retain their normal priority.
+    pub low_priority: bool,
+    /// Force selection of a specific Device ID.
+    pub device_id: Option<u32>,
+}
+
+#[derive(Debug)]
+pub enum NotSupportedError {
+    Platform(PlatformError),
+    NoSupportedDeviceFound,
+    PlatformNotSupported,
+}
+
+impl fmt::Display for NotSupportedError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::Platform(ref e) => write!(f, "platform error: {}", e),
+            Self::NoSupportedDeviceFound => f.write_str("no supported device found"),
+            Self::PlatformNotSupported => f.write_str("platform not supported"),
+        }
+    }
+}
+
+impl std::error::Error for NotSupportedError {}
+
+impl From<PlatformError> for NotSupportedError {
+    fn from(error: PlatformError) -> Self {
+        Self::Platform(error)
+    }
+}
+
+/// Error indicating a GPU device failure.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DeviceError {
+    /// The GPU device has been lost and can no longer be used.
+    DeviceLost,
+    /// The GPU ran out of memory.
+    OutOfMemory,
+}
+
+impl fmt::Display for DeviceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::DeviceLost => f.write_str("device lost"),
+            Self::OutOfMemory => f.write_str("out of memory"),
+        }
+    }
+}
+
+impl std::error::Error for DeviceError {}
+
+/// GPU memory usage statistics.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MemoryStats {
+    /// Total memory budget across all device-local heaps (bytes).
+    /// Zero if the backend doesn't support memory budget queries.
+    pub budget: u64,
+    /// Current memory usage across all device-local heaps (bytes).
+    /// Zero if the backend doesn't support memory budget queries.
+    pub usage: u64,
+}
+
+/// Operand storage for a workgroup cooperative product with an f32 accumulator.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CooperativeMatrixOperand {
+    F16,
+    Bf16,
+}
+
+/// Flexible dimensions for one operand type, with f32 accumulators and results.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CooperativeMatrixGranularity {
+    pub operand: CooperativeMatrixOperand,
+    /// Granularity of M, N, and K, in elements.
+    pub size: [u32; 3],
+    pub invocations: u32,
+}
+
+/// Workgroup cooperative products with f32 accumulators and results.
+/// Configurations with f16 accumulators are not exposed.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct WorkgroupCooperativeMatrix {
+    pub granularities: Vec<CooperativeMatrixGranularity>,
+    pub max_workgroup_size: u32,
+    pub max_dimension: u32,
+    pub reserved_shared_memory: u32,
+}
+
+impl WorkgroupCooperativeMatrix {
+    pub fn supports(
+        &self,
+        operand: CooperativeMatrixOperand,
+        size: [u32; 3],
+        invocations: u32,
+    ) -> bool {
+        invocations > 0
+            && invocations <= self.max_workgroup_size
+            && self.granularities.iter().any(|g| {
+                g.operand == operand
+                    && g.invocations == invocations
+                    && size.iter().zip(g.size).all(|(&s, granularity)| {
+                        s > 0 && s <= self.max_dimension && granularity != 0 && s % granularity == 0
+                    })
+            })
+    }
+}
+
+/// Cooperative matrix support information.
+///
+/// Each list holds `[M, N, K]` configurations for a subgroup-scoped
+/// multiply-add. A is M×K, B is K×N, and the accumulator is M×N, so K is
+/// not implied by M and N. An empty list means that operand combination
+/// is unsupported. Subgroup components are 8 or 16; workgroup granularities
+/// are reported separately.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CooperativeMatrix {
+    /// All-f32 operands, accumulator, and result.
+    pub f32_shapes: Vec<[u32; 3]>,
+    /// f16 operands with an f32 accumulator and result.
+    pub f16_f32_shapes: Vec<[u32; 3]>,
+    /// bf16 operands with an f32 accumulator and result.
+    pub bf16_f32_shapes: Vec<[u32; 3]>,
+    /// Flexible workgroup products; empty on backends without this extension.
+    pub workgroup: WorkgroupCooperativeMatrix,
+}
+
+impl CooperativeMatrix {
+    pub fn supports_bfloat16(&self) -> bool {
+        !self.bf16_f32_shapes.is_empty()
+            || self
+                .workgroup
+                .granularities
+                .iter()
+                .any(|g| g.operand == CooperativeMatrixOperand::Bf16)
+    }
+
+    /// Returns true if any cooperative matrix configuration is supported.
+    pub fn is_supported(&self) -> bool {
+        !self.f32_shapes.is_empty()
+            || !self.f16_f32_shapes.is_empty()
+            || !self.bf16_f32_shapes.is_empty()
+            || !self.workgroup.granularities.is_empty()
+    }
+}
+
+/// Device capabilities. On Metal, shaders must receive runtime storage-buffer
+/// lengths explicitly: WGSL `arrayLength` is not supported for either ordinary
+/// buffer bindings or elements of binding arrays.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Capabilities {
+    /// Limits for compute pipelines containing storage buffers and plain data.
+    /// Zero limits are reported when compute is unavailable.
+    pub compute_binding_limits: ComputeBindingLimits,
+    /// Compute pipeline support.
+    pub compute: bool,
+    /// Native storage fences and coherent storage accesses within a dispatch.
+    /// Supported by Vulkan with its memory model and Apple silicon with MSL 3.2.
+    /// This provides memory ordering, not workgroup execution progress.
+    /// Publishing storage writes to other workgroups requires `@coherent` buffers.
+    pub device_memory_fence: bool,
+    /// Maximum shared-memory bytes per compute workgroup, or zero if not reported.
+    pub max_compute_shared_memory_size: u32,
+    /// Default subgroup width, or zero if this backend does not report one.
+    ///
+    /// On Vulkan this is `VkPhysicalDeviceSubgroupProperties::subgroupSize`.
+    /// Blade does not request a required subgroup size, so a compute shader
+    /// may run at another width.
+    pub subgroup_size: u32,
+    /// Indirect draw command support.
+    pub indirect_draw: bool,
+    /// Support binding arrays of sampled textures and storage buffers.
+    pub binding_array: bool,
+    /// Which shader stages support ray queries.
+    pub ray_query: ShaderVisibility,
+    /// Bit mask of supported MSAA sample counts.
+    pub sample_count_mask: u32,
+    /// Support for dual-source blending.
+    pub dual_source_blending: bool,
+    /// Support for 16-bit floating-point types in shaders.
+    pub shader_float16: bool,
+    /// Support for bfloat16 storage, conversion, and cooperative matrix operands.
+    /// Requires a BF16 cooperative matrix configuration, even for shaders that
+    /// only use storage and conversion.
+    pub shader_bfloat16: bool,
+    /// Support for integer dot product instructions in shaders,
+    /// such as `dot4U8Packed`.
+    pub shader_integer_dot_product: bool,
+    /// Cooperative matrix support.
+    pub cooperative_matrix: CooperativeMatrix,
+    /// Support for timestamping passes on the GPU.
+    ///
+    /// [`ContextDesc::timing`] panics on init if this is false.
+    pub timing: bool,
+}
+
+/// Device limits used when composing buffer-based compute pipelines.
+/// Plain data must additionally fit [`limits::PLAIN_DATA_SIZE`] and each
+/// group must fit [`limits::RESOURCES_IN_GROUP`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ComputeBindingLimits {
+    /// Indirect binding arrays (buffers and textures) allow at most this many elements.
+    /// A buffer array occupies one buffer binding on these backends.
+    /// `None` means each array element consumes a binding.
+    pub max_indirect_buffer_array_elements: Option<u32>,
+    /// Total storage buffers across all groups of one compute pipeline.
+    pub max_storage_buffers: u32,
+    /// Plain-data bindings, guaranteed independently of their sizes.
+    pub max_plain_data_bindings: u32,
+    /// Combined storage-buffer and plain-data bindings, after backend reservations.
+    /// On Vulkan, sampled/storage images share this stage-resource budget.
+    pub max_buffer_bindings: u32,
+    /// Direct sampled-texture slots; each direct-array element consumes one.
+    /// Indirect argument tables have their separate element limit above.
+    pub max_sampled_texture_bindings: u32,
+    /// Number of bound shader data groups.
+    pub max_bind_groups: u32,
+    /// Maximum bytes accessible through one storage buffer binding.
+    pub max_storage_buffer_range: u64,
+}
+
+#[derive(Clone, Debug)]
+pub enum DeviceReportStatus {
+    /// This device is available, with its capabilities.
+    Available {
+        is_default: bool,
+        caps: Capabilities,
+    },
+    /// This device was rejected for the given reason.
+    Rejected(String),
+}
+
+#[derive(Clone, Debug)]
+pub struct DeviceReport {
+    /// Vulkan physical device ID. Can be used in [`ContextDesc::device_id`].
+    pub device_id: u32,
+    /// Device information (name, driver, etc).
+    pub information: DeviceInformation,
+    /// Selection status of this device.
+    pub status: DeviceReportStatus,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct DeviceInformation {
+    /// If this is something like llvmpipe, not a real GPU
+    pub is_software_emulated: bool,
+    /// The name of the GPU device
+    pub device_name: String,
+    /// The driver used to talk to the GPU
+    pub driver_name: String,
+    /// Further information about the driver
+    pub driver_info: String,
+}
+
+impl Context {
+    pub fn create_surface_configured<
+        I: raw_window_handle::HasWindowHandle + raw_window_handle::HasDisplayHandle,
+    >(
+        &self,
+        window: &I,
+        config: SurfaceConfig,
+    ) -> Result<Surface, NotSupportedError> {
+        let mut surface = self.create_surface(window)?;
+        self.reconfigure_surface(&mut surface, config);
+        Ok(surface)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Memory {
+    /// Device-local memory. Fast for GPU operations.
+    Device,
+    /// Device-local memory for short-lived allocations.
+    ///
+    /// Backends with a transient allocator may optimize these allocations;
+    /// other backends treat them like [`Self::Device`].
+    DeviceTransient,
+    /// Shared CPU-GPU memory. Not so fast for GPU.
+    Shared,
+    /// Download memory. Optimized for CPU reads after GPU transfers.
+    Download,
+    /// Upload memory. Can only be transferred on GPU.
+    Upload,
+    /// External memory
+    External(ExternalMemorySource),
+}
+
+/// `None` exports a new handle; `Some` imports an existing allocation.
+//TODO add D3D11, D3D12 and metal support
+#[derive(Clone, Copy, Debug, PartialEq, Hash)]
+pub enum ExternalMemorySource {
+    #[cfg(target_os = "windows")]
+    Win32(Option<isize>),
+
+    #[cfg(target_os = "windows")]
+    Win32KMT(Option<isize>),
+
+    #[cfg(not(target_os = "windows"))]
+    /// A Vulkan OPAQUE_FD. Import borrows the FD
+    /// during resource creation and duplicates it for Vulkan; the caller retains
+    /// ownership of the original. Exported FDs are owned by the caller. Imported
+    /// resources do not expose an external source.
+    ///
+    /// The caller must ensure compatible physical devices and drivers, identical
+    /// resource descriptions, and the same allocation recipe on both sides.
+    /// Blade allocates exactly the Vulkan memory requirement size, binds at zero,
+    /// and selects the highest compatible memory type index, excluding unknown
+    /// property flags and non-coherent host-visible types. Dedicated allocations
+    /// and device groups are not supported.
+    ///
+    /// External buffers use exclusive sharing and TRANSFER_SRC, TRANSFER_DST,
+    /// UNIFORM_BUFFER, STORAGE_BUFFER, INDEX_BUFFER, VERTEX_BUFFER and
+    /// INDIRECT_BUFFER usage, without device-address or ray-tracing usage/flags.
+    /// Exporting and importing the same buffer description therefore derives the
+    /// same allocation. Foreign exporters must follow this recipe too; an
+    /// arbitrary opaque FD does not provide enough information to infer it.
+    Fd(Option<i32>),
+
+    #[cfg(target_os = "linux")]
+    /// DMA-BUF import borrows and duplicates the FD, as with `Fd`.
+    Dma(Option<i32>),
+
+    /// Is a pointer cast to usize, reason being it otherwise can't be used as sync and send, you should manage memory access to this yourself
+    HostAllocation(usize),
+}
+
+impl Memory {
+    pub fn is_host_visible(&self) -> bool {
+        match *self {
+            Self::Shared
+            | Self::Download
+            | Self::Upload
+            | Self::External(ExternalMemorySource::HostAllocation(_)) => true,
+            Self::Device | Self::DeviceTransient | Self::External(_) => false,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct BufferDesc<'a> {
+    pub name: &'a str,
+    pub size: u64,
+    pub memory: Memory,
+}
+
+/// Binding target hint for [`sync_buffer`](traits::ResourceDevice::sync_buffer).
+///
+/// Only meaningful on the GLES backend under WebGL2, where a buffer is
+/// permanently assigned to either the element-array class or the general
+/// data class by its first bind. Other backends ignore it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BufferTarget {
+    /// Anything other than index data: vertices, uniforms, texels, etc.
+    Data,
+    /// Index data for indexed draws.
+    Index,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct BufferPiece {
+    pub buffer: Buffer,
+    pub offset: u64,
+}
+
+impl From<Buffer> for BufferPiece {
+    fn from(buffer: Buffer) -> Self {
+        Self { buffer, offset: 0 }
+    }
+}
+
+impl BufferPiece {
+    pub fn data(&self) -> *mut u8 {
+        let base = self.buffer.data();
+        assert!(!base.is_null());
+        debug_assert!(
+            self.offset <= self.buffer.size(),
+            "BufferPiece offset {} exceeds buffer size {}",
+            self.offset,
+            self.buffer.size(),
+        );
+        unsafe { base.offset(self.offset as isize) }
+    }
+}
+
+impl Buffer {
+    pub fn at(self, offset: u64) -> BufferPiece {
+        BufferPiece {
+            buffer: self,
+            offset,
+        }
+    }
+}
+
+pub type ResourceIndex = u32;
+/// An array of resources to be used with shader bindings.
+/// The generic argument tells the maximum number of resources.
+/// A pipeline layout may bind fewer than this maximum.
+/// Populate at least one element before binding; unused slots repeat the elements.
+pub struct ResourceArray<T, const N: ResourceIndex> {
+    data: Vec<T>,
+    free_list: Vec<ResourceIndex>,
+    limit: ResourceIndex,
+}
+impl<T, const N: ResourceIndex> ResourceArray<T, N> {
+    pub fn new() -> Self {
+        Self::with_limit(N)
+    }
+    /// Limit allocations to a smaller, device-specific shader layout.
+    pub fn with_limit(limit: ResourceIndex) -> Self {
+        assert!(limit <= N);
+        Self {
+            data: Vec::with_capacity(limit as usize),
+            free_list: Vec::new(),
+            limit,
+        }
+    }
+    pub fn alloc(&mut self, value: T) -> ResourceIndex {
+        if let Some(index) = self.free_list.pop() {
+            self.data[index as usize] = value;
+            index
+        } else {
+            let index = self.data.len() as u32;
+            assert!(
+                index < self.limit,
+                "resource array exceeds its {}-entry limit",
+                self.limit
+            );
+            self.data.push(value);
+            index
+        }
+    }
+    pub fn free(&mut self, index: ResourceIndex) {
+        self.free_list.push(index);
+    }
+    pub fn clear(&mut self) {
+        self.data.clear();
+        self.free_list.clear();
+    }
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+}
+impl<T, const N: ResourceIndex> std::ops::Index<ResourceIndex> for ResourceArray<T, N> {
+    type Output = T;
+    fn index(&self, index: ResourceIndex) -> &T {
+        &self.data[index as usize]
+    }
+}
+impl<T, const N: ResourceIndex> std::ops::IndexMut<ResourceIndex> for ResourceArray<T, N> {
+    fn index_mut(&mut self, index: ResourceIndex) -> &mut T {
+        &mut self.data[index as usize]
+    }
+}
+/// On Metal, pass runtime element lengths explicitly: `arrayLength` inside
+/// these buffers is not supported.
+pub type BufferArray<const N: ResourceIndex> = ResourceArray<BufferPiece, N>;
+pub type TextureArray<const N: ResourceIndex> = ResourceArray<TextureView, N>;
+pub type AccelerationStructureArray<const N: ResourceIndex> =
+    ResourceArray<AccelerationStructure, N>;
+
+#[derive(Clone, Copy, Debug)]
+pub struct TexturePiece {
+    pub texture: Texture,
+    pub mip_level: u32,
+    pub array_layer: u32,
+    pub origin: [u32; 3],
+}
+
+impl From<Texture> for TexturePiece {
+    fn from(texture: Texture) -> Self {
+        Self {
+            texture,
+            mip_level: 0,
+            array_layer: 0,
+            origin: [0; 3],
+        }
+    }
+}
+
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Hash, Eq, Ord, PartialEq, PartialOrd)]
+pub enum TextureFormat {
+    // color
+    R8Unorm,
+    Rg8Unorm,
+    Rg8Snorm,
+    Rgba8Unorm,
+    Rgba8UnormSrgb,
+    Bgra8Unorm,
+    Bgra8UnormSrgb,
+    Rgba8Snorm,
+    R16Float,
+    Rg16Float,
+    Rgba16Float,
+    R32Float,
+    Rg32Float,
+    Rgba32Float,
+    R32Uint,
+    Rg32Uint,
+    Rgba32Uint,
+    // depth and stencil
+    Depth32Float,
+    Depth32FloatStencil8Uint,
+    Stencil8Uint,
+    // S3TC block compression
+    Bc1Unorm,
+    Bc1UnormSrgb,
+    Bc2Unorm,
+    Bc2UnormSrgb,
+    Bc3Unorm,
+    Bc3UnormSrgb,
+    Bc4Unorm,
+    Bc4Snorm,
+    Bc5Unorm,
+    Bc5Snorm,
+    Bc6hUfloat,
+    Bc6hFloat,
+    Bc7Unorm,
+    Bc7UnormSrgb,
+    // packed 32-bit
+    Rgb10a2Unorm,
+    Rg11b10Ufloat,
+    Rgb9e5Ufloat,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct TexelBlockInfo {
+    pub dimensions: (u8, u8),
+    pub size: u8,
+}
+
+bitflags::bitflags! {
+    #[derive(Copy, Clone, Debug, Default, Hash, Eq, PartialEq)]
+    pub struct TexelAspects: u8 {
+        const COLOR = 0x1;
+        const DEPTH = 0x2;
+        const STENCIL = 0x4;
+    }
+}
+
+/// Dimensionality of a texture.
+#[derive(Copy, Clone, Debug, Hash, Eq, PartialEq)]
+pub enum TextureDimension {
+    /// 1D texture
+    D1,
+    /// 2D texture
+    D2,
+    /// 3D texture
+    D3,
+}
+
+#[derive(Copy, Clone, Debug, Hash, Eq, PartialEq)]
+pub enum ViewDimension {
+    D1,
+    D1Array,
+    D2,
+    D2Array,
+    Cube,
+    CubeArray,
+    D3,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Hash, Eq, PartialEq)]
+pub struct Extent {
+    pub width: u32,
+    pub height: u32,
+    pub depth: u32,
+}
+impl Default for Extent {
+    fn default() -> Self {
+        Self {
+            width: 1,
+            height: 1,
+            depth: 1,
+        }
+    }
+}
+impl fmt::Display for Extent {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}x{}x{}", self.width, self.height, self.depth)
+    }
+}
+
+impl Extent {
+    pub fn max_mip_levels(&self) -> u32 {
+        self.width
+            .max(self.height)
+            .max(self.depth)
+            .next_power_of_two()
+            .trailing_zeros()
+    }
+    pub fn at_mip_level(&self, level: u32) -> Self {
+        Self {
+            width: (self.width >> level).max(1),
+            height: (self.height >> level).max(1),
+            depth: (self.depth >> level).max(1),
+        }
+    }
+}
+
+bitflags::bitflags! {
+    #[derive(Copy, Clone, Debug, Default, Hash, Eq, PartialEq)]
+    pub struct TextureUsage: u32 {
+        const COPY = 1 << 0;
+        const TARGET = 1 << 1;
+        const RESOURCE = 1 << 2;
+        const STORAGE = 1 << 3;
+    }
+}
+
+#[derive(Debug)]
+pub struct TextureDesc<'a> {
+    pub name: &'a str,
+    pub format: TextureFormat,
+    pub size: Extent,
+    pub array_layer_count: u32,
+    pub mip_level_count: u32,
+    pub sample_count: u32,
+    pub dimension: TextureDimension,
+    pub usage: TextureUsage,
+    pub external: Option<ExternalMemorySource>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TextureSubresources {
+    pub base_mip_level: u32,
+    pub mip_level_count: Option<NonZeroU32>,
+    pub base_array_layer: u32,
+    pub array_layer_count: Option<NonZeroU32>,
+}
+
+#[derive(Debug)]
+pub struct TextureViewDesc<'a> {
+    pub name: &'a str,
+    pub format: TextureFormat,
+    pub dimension: ViewDimension,
+    pub subresources: &'a TextureSubresources,
+}
+
+bitflags::bitflags! {
+    #[derive(Copy, Clone, Debug, Default, Hash, Eq, PartialEq)]
+    pub struct ShaderVisibility: u32 {
+        const COMPUTE = 1 << 0;
+        const VERTEX = 1 << 1;
+        const FRAGMENT = 1 << 2;
+    }
+}
+
+/// How edges should be handled in texture addressing.
+#[derive(Copy, Clone, Debug, Default, Hash, Eq, PartialEq)]
+pub enum AddressMode {
+    /// Clamp the value to the edge of the texture.
+    #[default]
+    ClampToEdge,
+    /// Repeat the texture in a tiling fashion.
+    Repeat,
+    /// Repeat the texture, mirroring it every repeat.
+    MirrorRepeat,
+    /// Clamp the value to the border of the texture.
+    ClampToBorder,
+}
+
+/// Texel mixing mode when sampling between texels.
+#[derive(Copy, Clone, Debug, Default, Hash, Eq, PartialEq)]
+pub enum FilterMode {
+    /// Nearest neighbor sampling.
+    #[default]
+    Nearest,
+    /// Linear Interpolation
+    Linear,
+}
+
+/// Comparison function used for depth and stencil operations.
+#[derive(Copy, Clone, Debug, Default, Hash, Eq, PartialEq)]
+pub enum CompareFunction {
+    /// Function never passes
+    Never,
+    /// Function passes if new value less than existing value
+    Less,
+    /// Function passes if new value is equal to existing value. When using
+    /// this compare function, make sure to mark your Vertex Shader's `@builtin(position)`
+    /// output as `@invariant` to prevent artifacting.
+    Equal,
+    /// Function passes if new value is less than or equal to existing value
+    LessEqual,
+    /// Function passes if new value is greater than existing value
+    Greater,
+    /// Function passes if new value is not equal to existing value. When using
+    /// this compare function, make sure to mark your Vertex Shader's `@builtin(position)`
+    /// output as `@invariant` to prevent artifacting.
+    NotEqual,
+    /// Function passes if new value is greater than or equal to existing value
+    GreaterEqual,
+    /// Function always passes
+    #[default]
+    Always,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TextureColor {
+    TransparentBlack,
+    OpaqueBlack,
+    White,
+}
+
+#[derive(Debug, Default)]
+pub struct SamplerDesc<'a> {
+    pub name: &'a str,
+    pub address_modes: [AddressMode; 3],
+    pub mag_filter: FilterMode,
+    pub min_filter: FilterMode,
+    pub mipmap_filter: FilterMode,
+    pub lod_min_clamp: f32,
+    pub lod_max_clamp: Option<f32>,
+    pub compare: Option<CompareFunction>,
+    pub anisotropy_clamp: u32,
+    pub border_color: Option<TextureColor>,
+}
+
+#[derive(Debug)]
+pub enum AccelerationStructureType {
+    TopLevel,
+    BottomLevel,
+}
+
+#[derive(Debug)]
+pub struct AccelerationStructureDesc<'a> {
+    pub name: &'a str,
+    pub ty: AccelerationStructureType,
+    pub size: u64,
+    /// When set, the BLAS can later be refit with
+    /// [`traits::AccelerationStructureEncoder::update_bottom_level`].
+    pub updatable: bool,
+}
+
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Hash, Eq, Ord, PartialEq, PartialOrd)]
+pub enum VertexFormat {
+    F32,
+    F32Vec2,
+    F32Vec3,
+    F32Vec4,
+    U32,
+    U32Vec2,
+    U32Vec3,
+    U32Vec4,
+    I32,
+    I32Vec2,
+    I32Vec3,
+    I32Vec4,
+}
+
+#[derive(Clone, Debug)]
+pub struct AccelerationStructureMesh {
+    pub vertex_data: BufferPiece,
+    pub vertex_format: VertexFormat,
+    pub vertex_stride: u32,
+    pub vertex_count: u32,
+    pub index_data: BufferPiece,
+    pub index_type: Option<IndexType>,
+    pub triangle_count: u32,
+    /// An uploaded [`AccelerationStructureTransform`], or a default buffer for
+    /// the identity transform. The offset must be a multiple of 16 bytes.
+    pub transform_data: BufferPiece,
+    pub is_opaque: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct AccelerationStructureInstance {
+    pub acceleration_structure_index: u32,
+    pub transform: Transform,
+    pub mask: u32,
+    pub custom_index: u32,
+}
+
+impl Default for AccelerationStructureInstance {
+    fn default() -> Self {
+        Self {
+            acceleration_structure_index: 0,
+            transform: IDENTITY_TRANSFORM,
+            mask: 0xFF,
+            custom_index: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct AccelerationStructureSizes {
+    // TODO: let the size query take `updatable` if conservative sizing becomes costly.
+    /// Permanent GPU data. For a BLAS this is large enough for either a
+    /// one-shot or a refittable structure.
+    pub data: u64,
+    /// Scratch space. For a BLAS this covers a full build and a later refit.
+    pub scratch: u64,
+}
+
+pub struct Shader {
+    module: naga::Module,
+    info: naga::valid::ModuleInfo,
+    source: String,
+}
+
+#[derive(Clone, Copy)]
+pub struct ShaderFunction<'a> {
+    pub shader: &'a Shader,
+    pub entry_point: &'a str,
+    pub constants: &'a PipelineConstants,
+}
+
+impl ShaderFunction<'_> {
+    fn entry_point_index(&self) -> usize {
+        self.shader
+            .module
+            .entry_points
+            .iter()
+            .position(|ep| ep.name == self.entry_point)
+            .expect("Entry point not found in the shader")
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ShaderBinding {
+    Texture,
+    TextureArray { count: u32 },
+    Sampler,
+    Buffer,
+    BufferArray { count: u32 },
+    AccelerationStructure,
+    AccelerationStructureArray { count: u32 },
+    Plain { size: u32 },
+}
+
+pub trait ShaderBindable: Clone + Copy + derive::HasShaderBinding {
+    fn bind_to(&self, context: &mut PipelineContext, index: u32);
+}
+
+#[derive(Debug)]
+struct ShaderDataInfo {
+    visibility: ShaderVisibility,
+    binding_access: Box<[StorageAccess]>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ShaderDataLayout {
+    pub bindings: Vec<(&'static str, ShaderBinding)>,
+}
+impl ShaderDataLayout {
+    pub const EMPTY: &'static Self = &Self {
+        bindings: Vec::new(),
+    };
+
+    fn to_info(&self) -> ShaderDataInfo {
+        ShaderDataInfo {
+            visibility: ShaderVisibility::empty(),
+            binding_access: vec![StorageAccess::empty(); self.bindings.len()].into_boxed_slice(),
+        }
+    }
+}
+
+pub trait ShaderData {
+    fn layout() -> ShaderDataLayout;
+    fn fill(&self, context: PipelineContext);
+}
+
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct VertexAttribute {
+    pub offset: u32,
+    pub format: VertexFormat,
+}
+
+struct VertexAttributeMapping {
+    buffer_index: usize,
+    attribute_index: usize,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct VertexLayout {
+    pub attributes: Vec<(&'static str, VertexAttribute)>,
+    pub stride: u32,
+}
+
+pub trait Vertex {
+    fn layout() -> VertexLayout;
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct VertexFetchState<'a> {
+    pub layout: &'a VertexLayout,
+    pub instanced: bool,
+}
+
+pub struct ShaderDesc<'a> {
+    /// WGSL source code. Used for parsing when `naga_module` is `None`,
+    /// or as debug info (SPIR-V source maps, shader dumps) when a module is provided.
+    pub source: &'a str,
+    /// Optional pre-built Naga IR module. When provided, `source` is skipped
+    /// for parsing and only used as debug info (if non-empty).
+    pub naga_module: Option<naga::Module>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum CommandType {
+    Transfer,
+    Compute,
+    #[default]
+    General,
+}
+
+pub struct CommandEncoderDesc<'a> {
+    pub name: &'a str,
+    /// Number of buffers that this encoder needs to keep alive.
+    /// For example, one buffer is being run on GPU while the
+    /// other is being actively encoded, which makes 2.
+    pub buffer_count: u32,
+    /// When set, automatic memory barriers between passes are
+    /// not inserted. The user is responsible for calling
+    /// `barrier()` on the encoder where synchronization is needed.
+    pub manual_barriers: bool,
+}
+
+pub struct ComputePipelineDesc<'a> {
+    pub name: &'a str,
+    pub data_layouts: &'a [&'a ShaderDataLayout],
+    pub compute: ShaderFunction<'a>,
+}
+
+/// A single statistic reported for a pipeline executable.
+#[derive(Clone, Debug)]
+pub struct PipelineStatistic {
+    /// Name of the statistic (e.g. "numUsedVgprs", "spilledSgprs").
+    pub name: String,
+    /// Human-readable description.
+    pub description: String,
+    /// Numeric value. Integer statistics are converted to `f64` for a uniform,
+    /// cross-platform representation.
+    pub value: f64,
+}
+
+/// Statistics for one executable stage within a pipeline.
+#[derive(Clone, Debug)]
+pub struct PipelineExecutableInfo {
+    /// Name of the executable (e.g. "Compute").
+    pub name: String,
+    /// Individual statistics.
+    pub statistics: Vec<PipelineStatistic>,
+}
+
+/// Primitive type the input mesh is composed of.
+#[derive(Copy, Clone, Debug, Default, Hash, Eq, PartialEq)]
+pub enum PrimitiveTopology {
+    /// Vertex data is a list of points. Each vertex is a new point.
+    PointList,
+    /// Vertex data is a list of lines. Each pair of vertices composes a new line.
+    ///
+    /// Vertices `0 1 2 3` create two lines `0 1` and `2 3`
+    LineList,
+    /// Vertex data is a strip of lines. Each set of two adjacent vertices form a line.
+    ///
+    /// Vertices `0 1 2 3` create three lines `0 1`, `1 2`, and `2 3`.
+    LineStrip,
+    /// Vertex data is a list of triangles. Each set of 3 vertices composes a new triangle.
+    ///
+    /// Vertices `0 1 2 3 4 5` create two triangles `0 1 2` and `3 4 5`
+    #[default]
+    TriangleList,
+    /// Vertex data is a triangle strip. Each set of three adjacent vertices form a triangle.
+    ///
+    /// Vertices `0 1 2 3 4 5` creates four triangles `0 1 2`, `2 1 3`, `2 3 4`, and `4 3 5`
+    TriangleStrip,
+}
+
+/// Vertex winding order which classifies the "front" face of a triangle.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub enum FrontFace {
+    /// Triangles with vertices in counter clockwise order are considered the front face.
+    ///
+    /// This is the default with right handed coordinate spaces.
+    #[default]
+    Ccw,
+    /// Triangles with vertices in clockwise order are considered the front face.
+    ///
+    /// This is the default with left handed coordinate spaces.
+    Cw,
+}
+
+/// Face of a vertex.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Face {
+    /// Front face
+    Front,
+    /// Back face
+    Back,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct PrimitiveState {
+    /// The primitive topology used to interpret vertices.
+    pub topology: PrimitiveTopology,
+    /// The face to consider the front for the purpose of culling and stencil operations.
+    pub front_face: FrontFace,
+    /// The face culling mode.
+    pub cull_mode: Option<Face>,
+    /// If set to true, the polygon depth is not clipped to 0-1 before rasterization.
+    pub unclipped_depth: bool,
+    /// If true, only the primitive edges are rasterized..
+    pub wireframe: bool,
+}
+
+/// Operation to perform on the stencil value.
+#[derive(Copy, Clone, Debug, Default, Hash, Eq, PartialEq)]
+pub enum StencilOperation {
+    /// Keep stencil value unchanged.
+    #[default]
+    Keep,
+    /// Set stencil value to zero.
+    Zero,
+    /// Replace stencil value with value provided.
+    Replace,
+    /// Bitwise inverts stencil value.
+    Invert,
+    /// Increments stencil value by one, clamping on overflow.
+    IncrementClamp,
+    /// Decrements stencil value by one, clamping on underflow.
+    DecrementClamp,
+    /// Increments stencil value by one, wrapping on overflow.
+    IncrementWrap,
+    /// Decrements stencil value by one, wrapping on underflow.
+    DecrementWrap,
+}
+
+/// Describes stencil state in a render pipeline.
+///
+/// If you are not using stencil state, set this to [`StencilFaceState::IGNORE`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct StencilFaceState {
+    /// Comparison function that determines if the fail_op or pass_op is used on the stencil buffer.
+    pub compare: CompareFunction,
+    /// Operation that is preformed when stencil test fails.
+    pub fail_op: StencilOperation,
+    /// Operation that is performed when depth test fails but stencil test succeeds.
+    pub depth_fail_op: StencilOperation,
+    /// Operation that is performed when stencil test success.
+    pub pass_op: StencilOperation,
+}
+
+impl StencilFaceState {
+    /// Ignore the stencil state for the face.
+    pub const IGNORE: Self = StencilFaceState {
+        compare: CompareFunction::Always,
+        fail_op: StencilOperation::Keep,
+        depth_fail_op: StencilOperation::Keep,
+        pass_op: StencilOperation::Keep,
+    };
+}
+
+impl Default for StencilFaceState {
+    fn default() -> Self {
+        Self::IGNORE
+    }
+}
+
+/// State of the stencil operation (fixed-pipeline stage).
+///
+/// For use in [`DepthStencilState`].
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct StencilState {
+    /// Front face mode.
+    pub front: StencilFaceState,
+    /// Back face mode.
+    pub back: StencilFaceState,
+    /// Stencil values are AND'd with this mask when reading and writing from the stencil buffer. Only low 8 bits are used.
+    pub read_mask: u32,
+    /// Stencil values are AND'd with this mask when writing to the stencil buffer. Only low 8 bits are used.
+    pub write_mask: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct DepthBiasState {
+    /// Constant depth biasing factor, in basic units of the depth format.
+    pub constant: i32,
+    /// Slope depth biasing factor.
+    pub slope_scale: f32,
+    /// Depth bias clamp value (absolute).
+    pub clamp: f32,
+}
+
+/// Describes the depth/stencil state in a render pipeline.
+#[derive(Clone, Debug)]
+pub struct DepthStencilState {
+    /// Format of the depth/stencil texture view.
+    pub format: TextureFormat,
+    /// If disabled, depth will not be written to.
+    pub depth_write_enabled: bool,
+    /// Comparison function used to compare depth values in the depth test.
+    pub depth_compare: CompareFunction,
+    /// Stencil state.
+    pub stencil: StencilState,
+    /// Depth bias state.
+    pub bias: DepthBiasState,
+}
+
+/// Alpha blend factor.
+#[derive(Copy, Clone, Debug, Hash, Eq, PartialEq)]
+pub enum BlendFactor {
+    /// 0.0
+    Zero,
+    /// 1.0
+    One,
+    /// S.component
+    Src,
+    /// 1.0 - S.component
+    OneMinusSrc,
+    /// S.alpha
+    SrcAlpha,
+    /// 1.0 - S.alpha
+    OneMinusSrcAlpha,
+    /// D.component
+    Dst,
+    /// 1.0 - D.component
+    OneMinusDst,
+    /// D.alpha
+    DstAlpha,
+    /// 1.0 - D.alpha
+    OneMinusDstAlpha,
+    /// min(S.alpha, 1.0 - D.alpha)
+    SrcAlphaSaturated,
+    /// Constant
+    Constant,
+    /// 1.0 - Constant
+    OneMinusConstant,
+    /// S1.component
+    Src1,
+    /// 1.0 - S1.component
+    OneMinusSrc1,
+    /// S1.alpha
+    Src1Alpha,
+    /// 1.0 - S1.alpha
+    OneMinusSrc1Alpha,
+}
+
+impl BlendFactor {
+    pub const fn uses_dual_source(&self) -> bool {
+        matches!(
+            self,
+            BlendFactor::Src1
+                | BlendFactor::OneMinusSrc1
+                | BlendFactor::Src1Alpha
+                | BlendFactor::OneMinusSrc1Alpha
+        )
+    }
+}
+
+/// Alpha blend operation.
+#[derive(Copy, Clone, Debug, Default, Hash, Eq, PartialEq)]
+pub enum BlendOperation {
+    /// Src + Dst
+    #[default]
+    Add,
+    /// Src - Dst
+    Subtract,
+    /// Dst - Src
+    ReverseSubtract,
+    /// min(Src, Dst)
+    Min,
+    /// max(Src, Dst)
+    Max,
+}
+
+/// Describes a blend component of a [`BlendState`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct BlendComponent {
+    /// Multiplier for the source, which is produced by the fragment shader.
+    pub src_factor: BlendFactor,
+    /// Multiplier for the destination, which is stored in the target.
+    pub dst_factor: BlendFactor,
+    /// The binary operation applied to the source and destination,
+    /// multiplied by their respective factors.
+    pub operation: BlendOperation,
+}
+
+impl BlendComponent {
+    /// Default blending state that replaces destination with the source.
+    pub const REPLACE: Self = Self {
+        src_factor: BlendFactor::One,
+        dst_factor: BlendFactor::Zero,
+        operation: BlendOperation::Add,
+    };
+
+    /// Blend state of (1 * src) + ((1 - src_alpha) * dst)
+    pub const OVER: Self = Self {
+        src_factor: BlendFactor::One,
+        dst_factor: BlendFactor::OneMinusSrcAlpha,
+        operation: BlendOperation::Add,
+    };
+
+    /// Blend state of src + dst
+    pub const ADDITIVE: Self = Self {
+        src_factor: BlendFactor::One,
+        dst_factor: BlendFactor::One,
+        operation: BlendOperation::Add,
+    };
+
+    pub const fn uses_dual_source(&self) -> bool {
+        self.src_factor.uses_dual_source() || self.dst_factor.uses_dual_source()
+    }
+}
+
+impl Default for BlendComponent {
+    fn default() -> Self {
+        Self::REPLACE
+    }
+}
+
+/// Describe the blend state of a render pipeline,
+/// within [`ColorTargetState`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct BlendState {
+    /// Color equation.
+    pub color: BlendComponent,
+    /// Alpha equation.
+    pub alpha: BlendComponent,
+}
+
+impl BlendState {
+    /// Blend mode that does no color blending, just overwrites the output with the contents of the shader.
+    pub const REPLACE: Self = Self {
+        color: BlendComponent::REPLACE,
+        alpha: BlendComponent::REPLACE,
+    };
+
+    /// Blend mode that does standard alpha blending with non-premultiplied alpha.
+    pub const ALPHA_BLENDING: Self = Self {
+        color: BlendComponent {
+            src_factor: BlendFactor::SrcAlpha,
+            dst_factor: BlendFactor::OneMinusSrcAlpha,
+            operation: BlendOperation::Add,
+        },
+        alpha: BlendComponent::OVER,
+    };
+
+    /// Blend mode that does standard alpha blending with premultiplied alpha.
+    pub const PREMULTIPLIED_ALPHA_BLENDING: Self = Self {
+        color: BlendComponent::OVER,
+        alpha: BlendComponent::OVER,
+    };
+
+    /// Blend mode that just adds the value.
+    pub const ADDITIVE: Self = Self {
+        color: BlendComponent::ADDITIVE,
+        alpha: BlendComponent::ADDITIVE,
+    };
+
+    pub const fn uses_dual_source(&self) -> bool {
+        self.color.uses_dual_source() || self.alpha.uses_dual_source()
+    }
+}
+
+bitflags::bitflags! {
+    /// Color write mask. Disabled color channels will not be written to.
+    #[repr(transparent)]
+    #[derive(Copy, Clone, Debug, Hash, Eq, PartialEq)]
+    pub struct ColorWrites: u32 {
+        /// Enable red channel writes
+        const RED = 1 << 0;
+        /// Enable green channel writes
+        const GREEN = 1 << 1;
+        /// Enable blue channel writes
+        const BLUE = 1 << 2;
+        /// Enable alpha channel writes
+        const ALPHA = 1 << 3;
+        /// Enable red, green, and blue channel writes
+        const COLOR = Self::RED.bits() | Self::GREEN.bits() | Self::BLUE.bits();
+        /// Enable writes to all channels.
+        const ALL = Self::RED.bits() | Self::GREEN.bits() | Self::BLUE.bits() | Self::ALPHA.bits();
+    }
+}
+
+impl Default for ColorWrites {
+    fn default() -> Self {
+        Self::ALL
+    }
+}
+
+/// Describes the color state of a render pipeline.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ColorTargetState {
+    /// The [`TextureFormat`] of the image that this pipeline will render to.
+    pub format: TextureFormat,
+    /// The blending that is used for this pipeline.
+    pub blend: Option<BlendState>,
+    /// Mask which enables/disables writes to different color/alpha channel.
+    pub write_mask: ColorWrites,
+}
+
+impl From<TextureFormat> for ColorTargetState {
+    fn from(format: TextureFormat) -> Self {
+        Self {
+            format,
+            blend: None,
+            write_mask: ColorWrites::ALL,
+        }
+    }
+}
+
+pub struct RenderPipelineDesc<'a> {
+    pub name: &'a str,
+    pub data_layouts: &'a [&'a ShaderDataLayout],
+    pub vertex: ShaderFunction<'a>,
+    pub vertex_fetches: &'a [VertexFetchState<'a>],
+    pub primitive: PrimitiveState,
+    pub depth_stencil: Option<DepthStencilState>,
+    pub fragment: Option<ShaderFunction<'a>>,
+    pub color_targets: &'a [ColorTargetState],
+    pub multisample_state: MultisampleState,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct MultisampleState {
+    pub sample_count: u32,
+    pub sample_mask: u64,
+    pub alpha_to_coverage: bool,
+}
+
+impl Default for MultisampleState {
+    fn default() -> Self {
+        Self {
+            sample_count: 1,
+            sample_mask: !0,
+            alpha_to_coverage: false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum InitOp {
+    Load,
+    Clear(TextureColor),
+    DontCare,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum FinishOp {
+    Store,
+    Discard,
+    /// The texture specified here will be stored but it is undefined what
+    /// happens to the original render target
+    ResolveTo(TextureView),
+    Ignore,
+}
+
+#[derive(Debug)]
+pub struct RenderTarget {
+    pub view: TextureView,
+    pub init_op: InitOp,
+    pub finish_op: FinishOp,
+}
+
+#[derive(Debug)]
+pub struct RenderTargetSet<'a> {
+    pub colors: &'a [RenderTarget],
+    pub depth_stencil: Option<RenderTarget>,
+}
+
+/// Mechanism used to acquire frames and display them on screen.
+#[derive(Copy, Clone, Debug, Default, Hash, Eq, PartialEq)]
+pub enum DisplaySync {
+    /// Block until the oldest frame is released.
+    #[default]
+    Block,
+    /// Display the most recently presented frame.
+    /// Falls back to `Tear` if unsupported.
+    Recent,
+    /// Tear the currently displayed frame when presenting a new one.
+    Tear,
+}
+
+#[derive(Copy, Clone, Debug, Default, Hash, Eq, PartialEq)]
+pub enum ColorSpace {
+    #[default]
+    Linear,
+    Srgb,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct SurfaceConfig {
+    pub size: Extent,
+    pub usage: TextureUsage,
+    pub display_sync: DisplaySync,
+    /// The color space that render output colors are expected to be in.
+    ///
+    /// This will affect the surface format returned by the `Context`.
+    ///
+    /// For example, if the display expects sRGB space and we render
+    /// in `ColorSpace::Linear` space, the returned format will be sRGB.
+    pub color_space: ColorSpace,
+    pub transparent: bool,
+    pub allow_exclusive_full_screen: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct XrSurfaceConfig {
+    pub size: Extent,
+    pub usage: TextureUsage,
+    pub color_space: ColorSpace,
+    pub view_count: u32,
+}
+
+impl Default for XrSurfaceConfig {
+    fn default() -> Self {
+        Self {
+            size: Extent::default(),
+            usage: TextureUsage::TARGET,
+            color_space: ColorSpace::Linear,
+            view_count: 2,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, Default, Hash, Eq, PartialEq)]
+pub enum AlphaMode {
+    #[default]
+    Ignored,
+    PreMultiplied,
+    PostMultiplied,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SurfaceInfo {
+    pub format: TextureFormat,
+    pub alpha: AlphaMode,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum IndexType {
+    U16,
+    U32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScissorRect {
+    pub x: i32,
+    pub y: i32,
+    pub w: u32,
+    pub h: u32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Viewport {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    pub depth: std::ops::Range<f32>,
+}
+
+/// GPU pass timestamps mapped onto the process monotonic clock.
+///
+/// Pass names are borrowed from the encoder.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Timing<'a> {
+    /// Pass starts in execution order.
+    pub passes: Vec<(&'a str, std::time::Instant)>,
+    /// Completion time of the final pass.
+    pub done: std::time::Instant,
+}
+
+impl Timing<'_> {
+    /// Return each pass's start-to-next-start duration, with the final pass
+    /// ending at [`Self::done`].
+    pub fn pass_durations(&self) -> impl Iterator<Item = (&str, std::time::Duration)> + '_ {
+        self.passes.iter().enumerate().map(move |(i, pass)| {
+            let end = self.passes.get(i + 1).map_or(self.done, |next| next.1);
+            (pass.0, end.duration_since(pass.1))
+        })
+    }
+}

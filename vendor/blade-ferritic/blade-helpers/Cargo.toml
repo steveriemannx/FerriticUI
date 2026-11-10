@@ -1,0 +1,33 @@
+[package]
+name = "blade-helpers"
+version = "0.3.0"
+edition = "2024"
+rust-version = "1.92"
+description = "Helper classes for Blade apps"
+keywords = ["graphics", "engine"]
+license = "MIT"
+repository = "https://github.com/kvark/blade"
+
+[lib]
+
+[features]
+
+[dependencies]
+blade-graphics = { workspace = true }
+blade-render = { workspace = true }
+egui = { workspace = true }
+glam = { workspace = true }
+mint = { workspace = true }
+strum = { workspace = true }
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+winit = { workspace = true }
+
+[package.metadata.cargo_check_external_types]
+allowed_external_types = [
+    "blade_graphics::*",
+    "blade_render::*",
+    "epaint::*",
+    "mint::*",
+    "winit::*",
+]

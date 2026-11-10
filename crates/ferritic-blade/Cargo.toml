@@ -1,0 +1,21 @@
+[package]
+name = "ferritic-blade"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "The Blade renderer of FerriticUI"
+
+[dependencies]
+ferritic-core.workspace = true
+blade-graphics.workspace = true
+blade-macros.workspace = true
+blade-util.workspace = true
+bytemuck.workspace = true
+log.workspace = true
+raw-window-handle.workspace = true
+
+[features]
+# Windows-only additions from the blade-ferritic branch; not used by the
+# current renderer yet (the D3D12 backend is not wired into the HAL traits).
+d3d12 = ["blade-graphics/d3d12"]

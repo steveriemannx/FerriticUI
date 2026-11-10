@@ -1,0 +1,17 @@
+[package]
+name = "ferritic"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "FerriticUI: a static retained-mode GUI library on blade"
+
+[dependencies]
+ferritic-core.workspace = true
+ferritic-text.workspace = true
+ferritic-winit.workspace = true
+ferritic-blade.workspace = true
+ferritic-macros = { path = "../ferritic-macros" }
+
+[dev-dependencies]
+png = "0.18"

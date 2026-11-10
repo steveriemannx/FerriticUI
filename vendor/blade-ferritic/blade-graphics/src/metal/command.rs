@@ -1,0 +1,1251 @@
+use objc2::runtime::ProtocolObject;
+use objc2_foundation::{NSArray, NSRange, NSString};
+use objc2_metal::{
+    self as metal, MTLAccelerationStructureCommandEncoder as _, MTLBlitCommandEncoder,
+    MTLBuffer as _, MTLCommandBuffer as _, MTLCommandEncoder as _, MTLComputeCommandEncoder as _,
+    MTLCounterSampleBuffer, MTLRenderCommandEncoder, MTLTexture as _,
+};
+use std::{
+    marker::PhantomData,
+    mem,
+    ptr::NonNull,
+    slice,
+    time::{Duration, Instant},
+};
+
+fn map_gpu_ns(
+    begin: super::TimestampSample,
+    end: super::TimestampSample,
+    timestamp: u64,
+) -> Instant {
+    // Metal requires two clock samples so GPU ticks can be scaled over the
+    // corresponding CPU interval rather than assumed to advance 1:1.
+    assert!(end.gpu_ns > begin.gpu_ns, "GPU clock did not advance");
+    assert!(
+        timestamp >= begin.gpu_ns,
+        "GPU timestamp predates calibration"
+    );
+    assert!(timestamp <= end.gpu_ns, "GPU timestamp follows calibration");
+    assert!(end.cpu_ns >= begin.cpu_ns, "CPU clock moved backwards");
+
+    let gpu_span = end.gpu_ns - begin.gpu_ns;
+    let gpu_offset = timestamp - begin.gpu_ns;
+    let cpu_span = end.cpu_ns - begin.cpu_ns;
+    let cpu_offset = (gpu_offset as f64 * cpu_span as f64 / gpu_span as f64).round() as u64;
+    begin.cpu_instant + Duration::from_nanos(cpu_offset)
+}
+
+/// Key for the ObjC associated object that stores BLAS references on a TLAS.
+static ASSOCIATED_BLAS_KEY: u8 = 0;
+
+// Query each populated resource only once, then pad the copied handles.
+// Re-querying a short array for every padded slot is especially costly with
+// objc2's debug signature validation enabled.
+fn pad_argument_table<T: Copy>(entries: &mut Vec<T>, count: usize) {
+    assert!(!entries.is_empty() && entries.len() <= count);
+    while entries.len() < count {
+        entries.extend_from_within(..entries.len().min(count - entries.len()));
+    }
+}
+
+#[test]
+fn argument_table_padding_preserves_the_resource_cycle() {
+    for populated in [1, 3, 511, 512] {
+        let mut entries: Vec<_> = (0..populated).collect();
+        pad_argument_table(&mut entries, 512);
+        assert_eq!(
+            entries,
+            (0..populated).cycle().take(512).collect::<Vec<_>>()
+        );
+    }
+}
+
+impl<T: bytemuck::Pod> crate::ShaderBindable for T {
+    fn bind_to(&self, ctx: &mut super::PipelineContext, index: u32) {
+        let slot = ctx.targets[index as usize] as _;
+        let size = mem::size_of::<T>();
+        unsafe {
+            let ptr = NonNull::new_unchecked(self as *const _ as *mut _);
+            if let Some(encoder) = ctx.vs_encoder {
+                encoder.setVertexBytes_length_atIndex(ptr, size, slot);
+            }
+            if let Some(encoder) = ctx.fs_encoder {
+                encoder.setFragmentBytes_length_atIndex(ptr, size, slot);
+            }
+            if let Some(encoder) = ctx.cs_encoder {
+                encoder.setBytes_length_atIndex(ptr, size, slot);
+            }
+        }
+    }
+}
+impl crate::ShaderBindable for super::TextureView {
+    fn bind_to(&self, ctx: &mut super::PipelineContext, index: u32) {
+        let slot = ctx.targets[index as usize] as _;
+        let value = Some(self.as_ref());
+        unsafe {
+            if let Some(encoder) = ctx.vs_encoder {
+                encoder.setVertexTexture_atIndex(value, slot);
+            }
+            if let Some(encoder) = ctx.fs_encoder {
+                encoder.setFragmentTexture_atIndex(value, slot);
+            }
+            if let Some(encoder) = ctx.cs_encoder {
+                encoder.setTexture_atIndex(value, slot);
+            }
+        }
+    }
+}
+impl<'a, const N: crate::ResourceIndex> crate::ShaderBindable for &'a crate::TextureArray<N> {
+    fn bind_to(&self, ctx: &mut super::PipelineContext, index: u32) {
+        let count = ctx.array_counts[index as usize] as usize;
+        assert!(count <= N as usize);
+        assert!(!self.data.is_empty() && self.data.len() <= count);
+        let mut ids = Vec::with_capacity(count);
+        ids.extend(self.data.iter().map(|view| view.as_ref().gpuResourceID()));
+        pad_argument_table(&mut ids, count);
+        ctx.bind_argument_table(index, &ids);
+        for view in &self.data {
+            let resource = unsafe { &*(view.raw as *const ProtocolObject<dyn metal::MTLResource>) };
+            ctx.use_resource(index, resource);
+        }
+    }
+}
+impl crate::ShaderBindable for super::Sampler {
+    fn bind_to(&self, ctx: &mut super::PipelineContext, index: u32) {
+        let slot = ctx.targets[index as usize] as _;
+        let value = Some(self.as_ref());
+        unsafe {
+            if let Some(encoder) = ctx.vs_encoder {
+                encoder.setVertexSamplerState_atIndex(value, slot);
+            }
+            if let Some(encoder) = ctx.fs_encoder {
+                encoder.setFragmentSamplerState_atIndex(value, slot);
+            }
+            if let Some(encoder) = ctx.cs_encoder {
+                encoder.setSamplerState_atIndex(value, slot);
+            }
+        }
+    }
+}
+impl crate::ShaderBindable for crate::BufferPiece {
+    fn bind_to(&self, ctx: &mut super::PipelineContext, index: u32) {
+        let slot = ctx.targets[index as usize] as _;
+        let value = Some(self.buffer.as_ref());
+        unsafe {
+            if let Some(encoder) = ctx.vs_encoder {
+                encoder.setVertexBuffer_offset_atIndex(value, self.offset as usize, slot);
+            }
+            if let Some(encoder) = ctx.fs_encoder {
+                encoder.setFragmentBuffer_offset_atIndex(value, self.offset as usize, slot);
+            }
+            if let Some(encoder) = ctx.cs_encoder {
+                encoder.setBuffer_offset_atIndex(value, self.offset as usize, slot);
+            }
+        }
+    }
+}
+
+impl super::PipelineContext<'_> {
+    fn bind_buffer_array_padded(
+        &mut self,
+        index: u32,
+        pieces: &[crate::BufferPiece],
+        count: usize,
+    ) {
+        assert!(!pieces.is_empty() && pieces.len() <= count);
+        assert_eq!(count, self.array_counts[index as usize] as usize);
+        let mut addresses = Vec::with_capacity(count);
+        addresses.extend(pieces.iter().map(|piece| {
+            assert!(piece.offset < piece.buffer.size());
+            assert_eq!(piece.offset % crate::limits::STORAGE_BUFFER_ALIGNMENT, 0);
+            piece.buffer.as_ref().gpuAddress() + piece.offset
+        }));
+        pad_argument_table(&mut addresses, count);
+        self.bind_argument_table(index, &addresses);
+        for piece in pieces {
+            let resource =
+                unsafe { &*(piece.buffer.raw as *const ProtocolObject<dyn metal::MTLResource>) };
+            self.use_resource(index, resource);
+        }
+    }
+
+    fn bind_argument_table<T>(&mut self, index: u32, entries: &[T]) {
+        assert!(objc2::available!(macos = 13.0, ios = 16.0));
+        assert!(!entries.is_empty());
+        assert_eq!(entries.len(), self.array_counts[index as usize] as usize);
+        assert!(entries.len() <= super::MAX_BINDING_ARRAY_ELEMENTS as usize);
+        let size = mem::size_of_val(entries);
+        let slot = self.targets[index as usize] as usize;
+        // setBytes copies into command-buffer-owned storage, including with
+        // unretained command buffers and multiple outstanding recordings.
+        unsafe {
+            let data = NonNull::new(entries.as_ptr() as *mut _).unwrap();
+            if let Some(encoder) = self.cs_encoder {
+                encoder.setBytes_length_atIndex(data, size, slot);
+            }
+            if let Some(encoder) = self.vs_encoder {
+                encoder.setVertexBytes_length_atIndex(data, size, slot);
+            }
+            if let Some(encoder) = self.fs_encoder {
+                encoder.setFragmentBytes_length_atIndex(data, size, slot);
+            }
+        }
+    }
+
+    fn use_resource(&self, index: u32, resource: &ProtocolObject<dyn metal::MTLResource>) {
+        let mut usage = metal::MTLResourceUsage::Read;
+        if self.write_mask & (1 << index) != 0 {
+            usage |= metal::MTLResourceUsage::Write;
+        }
+        if let Some(encoder) = self.cs_encoder {
+            encoder.useResource_usage(resource, usage);
+        }
+        if let Some(encoder) = self.vs_encoder {
+            encoder.useResource_usage_stages(resource, usage, metal::MTLRenderStages::Vertex);
+        }
+        if let Some(encoder) = self.fs_encoder {
+            encoder.useResource_usage_stages(resource, usage, metal::MTLRenderStages::Fragment);
+        }
+    }
+}
+impl<'a, const N: crate::ResourceIndex> crate::ShaderBindable for &'a crate::BufferArray<N> {
+    fn bind_to(&self, ctx: &mut super::PipelineContext, index: u32) {
+        let count = ctx.array_counts[index as usize] as usize;
+        assert!(count <= N as usize);
+        ctx.bind_buffer_array_padded(index, &self.data, count);
+    }
+}
+impl crate::ShaderBindable for crate::AccelerationStructure {
+    fn bind_to(&self, ctx: &mut super::PipelineContext, index: u32) {
+        let slot = ctx.targets[index as usize] as _;
+        let value = Some(self.as_ref());
+        // Metal requires useResource for the TLAS and all referenced BLAS,
+        // otherwise the GPU may not have them resident in memory.
+        // The BLAS pointers are stored as an ObjC associated object (NSData)
+        // on the TLAS, set during build_top_level.
+        let tlas_resource: &objc2::runtime::ProtocolObject<dyn metal::MTLResource> =
+            unsafe { &*(self.raw as *const _) };
+        let (blas_ptr, blas_count) = unsafe {
+            let data = objc2::ffi::objc_getAssociatedObject(
+                self.raw as *const objc2::runtime::AnyObject,
+                &ASSOCIATED_BLAS_KEY as *const _ as *const std::ffi::c_void,
+            );
+            if data.is_null() {
+                (NonNull::dangling(), 0)
+            } else {
+                let data: &objc2_foundation::NSData = &*(data as *const _);
+                let bytes = data.as_bytes_unchecked();
+                let len = bytes.len() / mem::size_of::<*mut ()>();
+                (NonNull::new_unchecked(bytes.as_ptr() as *mut _), len)
+            }
+        };
+        unsafe {
+            if let Some(encoder) = ctx.vs_encoder {
+                let stages = metal::MTLRenderStages::Vertex;
+                encoder.setVertexAccelerationStructure_atBufferIndex(value, slot);
+                encoder.useResource_usage_stages(
+                    tlas_resource,
+                    metal::MTLResourceUsage::Read,
+                    stages,
+                );
+                if blas_count != 0 {
+                    encoder.useResources_count_usage_stages(
+                        blas_ptr,
+                        blas_count,
+                        metal::MTLResourceUsage::Read,
+                        stages,
+                    );
+                }
+            }
+            if let Some(encoder) = ctx.fs_encoder {
+                let stages = metal::MTLRenderStages::Fragment;
+                encoder.setFragmentAccelerationStructure_atBufferIndex(value, slot);
+                encoder.useResource_usage_stages(
+                    tlas_resource,
+                    metal::MTLResourceUsage::Read,
+                    stages,
+                );
+                if blas_count != 0 {
+                    encoder.useResources_count_usage_stages(
+                        blas_ptr,
+                        blas_count,
+                        metal::MTLResourceUsage::Read,
+                        stages,
+                    );
+                }
+            }
+            if let Some(encoder) = ctx.cs_encoder {
+                encoder.setAccelerationStructure_atBufferIndex(value, slot);
+                encoder.useResource_usage(tlas_resource, metal::MTLResourceUsage::Read);
+                if blas_count != 0 {
+                    encoder.useResources_count_usage(
+                        blas_ptr,
+                        blas_count,
+                        metal::MTLResourceUsage::Read,
+                    );
+                }
+            }
+        }
+    }
+}
+impl<'a, const N: crate::ResourceIndex> crate::ShaderBindable
+    for &'a crate::AccelerationStructureArray<N>
+{
+    fn bind_to(&self, _ctx: &mut super::PipelineContext, _index: u32) {
+        unimplemented!()
+    }
+}
+
+impl super::TimingState {
+    fn add(&mut self, label: &str) -> Option<usize> {
+        let index = self.pass_names.len() - self.submitted_count;
+        if index == crate::limits::PASS_COUNT {
+            log::warn!("Reached the maximum for `limits::PASS_COUNT`, skipping the timer");
+            return None;
+        }
+        self.pass_names.push(label);
+        // Keep each pass's end sample separate from the next pass's start.
+        // In particular, completion must not depend on an empty blit encoder.
+        Some(index * 2)
+    }
+
+    fn resolve(&self, device: &ProtocolObject<dyn metal::MTLDevice>) -> crate::Timing<'_> {
+        let begin = self.calibration.expect("no last submission");
+        let n = self.submitted_count;
+        if n == 0 {
+            return crate::Timing {
+                passes: Vec::new(),
+                done: begin.cpu_instant,
+            };
+        }
+        let ns_data = unsafe {
+            self.sample_buffer
+                .resolveCounterRange(NSRange::new(0, n * 2))
+                .unwrap()
+        };
+        let counters = unsafe {
+            slice::from_raw_parts(
+                ns_data.as_bytes_unchecked().as_ptr() as *const u64,
+                ns_data.len() / mem::size_of::<u64>(),
+            )
+        };
+        let end = super::sample_timestamps(device);
+        // Metal may omit stage-boundary samples for an empty encoder. Reused
+        // slots then contain zero or a previous submission's timestamp. Give
+        // those passes zero duration at the last valid completion instead of
+        // mapping an unwritten sample (or inflating time to CPU readback).
+        let mut done = begin.cpu_instant;
+        let passes = self
+            .pass_names
+            .iter()
+            .take(n)
+            .zip(counters.chunks_exact(2))
+            .map(|(name, samples)| {
+                if (begin.gpu_ns..=end.gpu_ns).contains(&samples[0]) {
+                    done = done.max(map_gpu_ns(begin, end, samples[0]));
+                }
+                let start = done;
+                if (begin.gpu_ns..=end.gpu_ns).contains(&samples[1]) {
+                    done = done.max(map_gpu_ns(begin, end, samples[1]));
+                }
+                (name, start)
+            })
+            .collect();
+        crate::Timing { passes, done }
+    }
+}
+
+impl super::CommandEncoder {
+    fn begin_pass(&mut self, label: &str) {
+        if self.enable_debug_groups {
+            //HACK: close the previous group
+            if self.has_open_debug_group {
+                self.raw.as_mut().unwrap().popDebugGroup();
+            } else {
+                self.has_open_debug_group = true;
+            }
+            let string = NSString::from_str(label);
+            self.raw.as_mut().unwrap().pushDebugGroup(&string);
+        }
+    }
+
+    pub fn barrier(&mut self) {}
+
+    pub(super) fn finish(&mut self) -> super::RawCommandBuffer {
+        if self.has_open_debug_group {
+            self.raw.as_mut().unwrap().popDebugGroup();
+        }
+        self.raw.take().unwrap()
+    }
+
+    pub fn transfer(&mut self, label: &str) -> super::TransferCommandEncoder<'_> {
+        self.begin_pass(label);
+        let raw = objc2::rc::autoreleasepool(|_| unsafe {
+            let descriptor = metal::MTLBlitPassDescriptor::new();
+            if let Some(ref mut timing_state) = self.timing_state
+                && let Some(start) = timing_state.add(label)
+            {
+                let sba = descriptor
+                    .sampleBufferAttachments()
+                    .objectAtIndexedSubscript(0);
+                sba.setSampleBuffer(Some(&timing_state.sample_buffer));
+                sba.setStartOfEncoderSampleIndex(start);
+                sba.setEndOfEncoderSampleIndex(start + 1);
+            }
+
+            self.raw
+                .as_mut()
+                .unwrap()
+                .blitCommandEncoderWithDescriptor(&descriptor)
+                .unwrap()
+        });
+        super::TransferCommandEncoder {
+            raw,
+            phantom: PhantomData,
+        }
+    }
+
+    pub fn acceleration_structure(
+        &mut self,
+        label: &str,
+    ) -> super::AccelerationStructureCommandEncoder<'_> {
+        let raw = objc2::rc::autoreleasepool(|_| unsafe {
+            let descriptor = metal::MTLAccelerationStructurePassDescriptor::new();
+
+            if let Some(ref mut timing_state) = self.timing_state
+                && let Some(start) = timing_state.add(label)
+            {
+                let sba = descriptor
+                    .sampleBufferAttachments()
+                    .objectAtIndexedSubscript(0);
+                sba.setSampleBuffer(Some(&timing_state.sample_buffer));
+                sba.setStartOfEncoderSampleIndex(start);
+                sba.setEndOfEncoderSampleIndex(start + 1);
+            }
+
+            self.raw
+                .as_mut()
+                .unwrap()
+                .accelerationStructureCommandEncoderWithDescriptor(&descriptor)
+        });
+        super::AccelerationStructureCommandEncoder {
+            raw,
+            phantom: PhantomData,
+        }
+    }
+
+    pub fn compute(&mut self, label: &str) -> super::ComputeCommandEncoder<'_> {
+        let raw = objc2::rc::autoreleasepool(|_| unsafe {
+            let descriptor = metal::MTLComputePassDescriptor::new();
+            if self.enable_dispatch_type {
+                descriptor.setDispatchType(metal::MTLDispatchType::Concurrent);
+            }
+
+            if let Some(ref mut timing_state) = self.timing_state
+                && let Some(start) = timing_state.add(label)
+            {
+                let sba = descriptor
+                    .sampleBufferAttachments()
+                    .objectAtIndexedSubscript(0);
+                sba.setSampleBuffer(Some(&timing_state.sample_buffer));
+                sba.setStartOfEncoderSampleIndex(start);
+                sba.setEndOfEncoderSampleIndex(start + 1);
+            }
+
+            self.raw
+                .as_mut()
+                .unwrap()
+                .computeCommandEncoderWithDescriptor(&descriptor)
+                .unwrap()
+        });
+        super::ComputeCommandEncoder {
+            raw,
+            enable_debug_groups: self.enable_debug_groups,
+            phantom: PhantomData,
+        }
+    }
+
+    pub fn render(
+        &mut self,
+        label: &str,
+        targets: crate::RenderTargetSet,
+    ) -> super::RenderCommandEncoder<'_> {
+        let raw = objc2::rc::autoreleasepool(|_| {
+            let descriptor = metal::MTLRenderPassDescriptor::new();
+
+            for (i, rt) in targets.colors.iter().enumerate() {
+                let at_descriptor =
+                    unsafe { descriptor.colorAttachments().objectAtIndexedSubscript(i) };
+                at_descriptor.setTexture(Some(rt.view.as_ref()));
+
+                let load_action = match rt.init_op {
+                    crate::InitOp::Load => metal::MTLLoadAction::Load,
+                    crate::InitOp::Clear(color) => {
+                        let clear_color = map_clear_color(color);
+                        at_descriptor.setClearColor(clear_color);
+                        metal::MTLLoadAction::Clear
+                    }
+                    crate::InitOp::DontCare => metal::MTLLoadAction::DontCare,
+                };
+                at_descriptor.setLoadAction(load_action);
+
+                let store_action = match rt.finish_op {
+                    crate::FinishOp::Store | crate::FinishOp::Ignore => {
+                        metal::MTLStoreAction::Store
+                    }
+                    crate::FinishOp::Discard => metal::MTLStoreAction::DontCare,
+                    crate::FinishOp::ResolveTo(ref view) => {
+                        at_descriptor.setResolveTexture(Some(view.as_ref()));
+                        metal::MTLStoreAction::MultisampleResolve
+                    }
+                };
+                at_descriptor.setStoreAction(store_action);
+            }
+
+            if let Some(ref rt) = targets.depth_stencil {
+                if rt.view.aspects.contains(crate::TexelAspects::DEPTH) {
+                    let at_descriptor = descriptor.depthAttachment();
+                    at_descriptor.setTexture(Some(rt.view.as_ref()));
+                    let load_action = match rt.init_op {
+                        crate::InitOp::Load => metal::MTLLoadAction::Load,
+                        crate::InitOp::Clear(color) => {
+                            let clear_depth = color.depth_clear_value();
+                            at_descriptor.setClearDepth(clear_depth as f64);
+                            metal::MTLLoadAction::Clear
+                        }
+                        crate::InitOp::DontCare => metal::MTLLoadAction::DontCare,
+                    };
+                    let store_action = match rt.finish_op {
+                        crate::FinishOp::Store | crate::FinishOp::Ignore => {
+                            metal::MTLStoreAction::Store
+                        }
+                        crate::FinishOp::Discard => metal::MTLStoreAction::DontCare,
+                        crate::FinishOp::ResolveTo(_) => panic!("Can't resolve depth texture"),
+                    };
+                    at_descriptor.setLoadAction(load_action);
+                    at_descriptor.setStoreAction(store_action);
+                }
+
+                if rt.view.aspects.contains(crate::TexelAspects::STENCIL) {
+                    let at_descriptor = descriptor.stencilAttachment();
+                    at_descriptor.setTexture(Some(rt.view.as_ref()));
+
+                    let load_action = match rt.init_op {
+                        crate::InitOp::Load => metal::MTLLoadAction::Load,
+                        crate::InitOp::Clear(color) => {
+                            let clear_stencil = color.stencil_clear_value();
+                            at_descriptor.setClearStencil(clear_stencil);
+                            metal::MTLLoadAction::Clear
+                        }
+                        crate::InitOp::DontCare => metal::MTLLoadAction::DontCare,
+                    };
+                    let store_action = match rt.finish_op {
+                        crate::FinishOp::Store | crate::FinishOp::Ignore => {
+                            metal::MTLStoreAction::Store
+                        }
+                        crate::FinishOp::Discard => metal::MTLStoreAction::DontCare,
+                        crate::FinishOp::ResolveTo(_) => panic!("Can't resolve stencil texture"),
+                    };
+
+                    at_descriptor.setLoadAction(load_action);
+                    at_descriptor.setStoreAction(store_action);
+                }
+            }
+
+            if let Some(ref mut timing_state) = self.timing_state
+                && let Some(start) = timing_state.add(label)
+            {
+                unsafe {
+                    let sba = descriptor
+                        .sampleBufferAttachments()
+                        .objectAtIndexedSubscript(0);
+                    sba.setSampleBuffer(Some(&timing_state.sample_buffer));
+                    sba.setStartOfVertexSampleIndex(start);
+                    sba.setEndOfFragmentSampleIndex(start + 1);
+                }
+            }
+
+            self.raw
+                .as_mut()
+                .unwrap()
+                .renderCommandEncoderWithDescriptor(&descriptor)
+                .unwrap()
+        });
+
+        super::RenderCommandEncoder {
+            raw,
+            enable_debug_groups: self.enable_debug_groups,
+            phantom: PhantomData,
+        }
+    }
+}
+
+#[hidden_trait::expose]
+impl crate::traits::CommandEncoder for super::CommandEncoder {
+    type Texture = super::Texture;
+    type Frame = super::Frame;
+
+    fn start(&mut self) {
+        if let Some(ref mut timing_state) = self.timing_state {
+            timing_state
+                .pass_names
+                .truncate(timing_state.submitted_count);
+        }
+
+        let queue = self.queue.lock().unwrap();
+        self.raw = Some(objc2::rc::autoreleasepool(|_| {
+            use metal::MTLCommandQueue as _;
+            let cmd_buf = queue.commandBufferWithUnretainedReferences().unwrap();
+            if !self.name.is_empty() {
+                cmd_buf.setLabel(Some(&NSString::from_str(&self.name)));
+            }
+            cmd_buf
+        }));
+        self.has_open_debug_group = false;
+    }
+
+    fn init_texture(&mut self, _texture: super::Texture) {}
+
+    fn present(&mut self, frame: super::Frame) {
+        self.raw.as_mut().unwrap().presentDrawable(&frame.drawable);
+    }
+
+    /// `CAMetalLayer` has no way to present part of a drawable.
+    fn present_with_damage(&mut self, frame: super::Frame, _damage: &[crate::ScissorRect]) {
+        self.present(frame);
+    }
+
+    fn last_timing(&self) -> crate::Timing<'_> {
+        let ts = self
+            .timing_state
+            .as_ref()
+            .expect("GPU timing is not enabled");
+        use metal::MTLCommandQueue as _;
+        let device = self.queue.lock().unwrap().device();
+        ts.resolve(&device)
+    }
+}
+
+#[hidden_trait::expose]
+impl crate::traits::TransferEncoder for super::TransferCommandEncoder<'_> {
+    type BufferPiece = crate::BufferPiece;
+    type TexturePiece = crate::TexturePiece;
+
+    fn fill_buffer(&mut self, dst: crate::BufferPiece, size: u64, value: u8) {
+        let range = NSRange {
+            location: dst.offset as usize,
+            length: size as usize,
+        };
+        self.raw
+            .fillBuffer_range_value(dst.buffer.as_ref(), range, value);
+    }
+
+    fn copy_buffer_to_buffer(
+        &mut self,
+        src: crate::BufferPiece,
+        dst: crate::BufferPiece,
+        size: u64,
+    ) {
+        unsafe {
+            self.raw
+                .copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
+                    src.buffer.as_ref(),
+                    src.offset as usize,
+                    dst.buffer.as_ref(),
+                    dst.offset as usize,
+                    size as usize,
+                )
+        };
+    }
+    fn copy_texture_to_texture(
+        &mut self,
+        src: crate::TexturePiece,
+        dst: crate::TexturePiece,
+        size: crate::Extent,
+    ) {
+        unsafe {
+            self.raw.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
+                src.texture.as_ref(),
+                src.array_layer as usize,
+                src.mip_level as usize,
+                map_origin(&src.origin),
+                map_extent(&size),
+                dst.texture.as_ref(),
+                dst.array_layer as usize,
+                dst.mip_level as usize,
+                map_origin(&dst.origin),
+            )
+        };
+    }
+
+    fn copy_buffer_to_texture(
+        &mut self,
+        src: crate::BufferPiece,
+        bytes_per_row: u32,
+        dst: crate::TexturePiece,
+        size: crate::Extent,
+    ) {
+        unsafe {
+            self.raw.copyFromBuffer_sourceOffset_sourceBytesPerRow_sourceBytesPerImage_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin_options(
+                src.buffer.as_ref(),
+                src.offset as usize,
+                bytes_per_row as usize,
+                0,
+                map_extent(&size),
+                dst.texture.as_ref(),
+                dst.array_layer as usize,
+                dst.mip_level as usize,
+                map_origin(&dst.origin),
+                metal::MTLBlitOption::empty(),
+            )
+        };
+    }
+
+    fn copy_texture_to_buffer(
+        &mut self,
+        src: crate::TexturePiece,
+        dst: crate::BufferPiece,
+        bytes_per_row: u32,
+        size: crate::Extent,
+    ) {
+        unsafe {
+            self.raw.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage_options(
+                src.texture.as_ref(),
+                src.array_layer as usize,
+                src.mip_level as usize,
+                map_origin(&src.origin),
+                map_extent(&size),
+                dst.buffer.as_ref(),
+                dst.offset as usize,
+                bytes_per_row as usize,
+                0,
+                metal::MTLBlitOption::empty(),
+            )
+        };
+    }
+}
+
+impl Drop for super::TransferCommandEncoder<'_> {
+    fn drop(&mut self) {
+        self.raw.endEncoding();
+    }
+}
+
+#[hidden_trait::expose]
+impl crate::traits::AccelerationStructureEncoder
+    for super::AccelerationStructureCommandEncoder<'_>
+{
+    type AccelerationStructure = crate::AccelerationStructure;
+    type AccelerationStructureMesh = crate::AccelerationStructureMesh;
+    type BufferPiece = crate::BufferPiece;
+
+    fn build_bottom_level(
+        &mut self,
+        acceleration_structure: super::AccelerationStructure,
+        meshes: &[crate::AccelerationStructureMesh],
+        scratch_data: crate::BufferPiece,
+    ) {
+        let descriptor = super::make_bottom_level_acceleration_structure_desc(
+            meshes,
+            acceleration_structure.updatable,
+        );
+        self.raw
+            .buildAccelerationStructure_descriptor_scratchBuffer_scratchBufferOffset(
+                acceleration_structure.as_ref(),
+                &descriptor,
+                scratch_data.buffer.as_ref(),
+                scratch_data.offset as usize,
+            );
+    }
+
+    fn update_bottom_level(
+        &mut self,
+        acceleration_structure: super::AccelerationStructure,
+        meshes: &[crate::AccelerationStructureMesh],
+        scratch_data: crate::BufferPiece,
+    ) {
+        let descriptor = super::make_bottom_level_acceleration_structure_desc(
+            meshes,
+            acceleration_structure.updatable,
+        );
+        unsafe {
+            self.raw
+                .refitAccelerationStructure_descriptor_destination_scratchBuffer_scratchBufferOffset(
+                    acceleration_structure.as_ref(),
+                    &descriptor,
+                    Some(acceleration_structure.as_ref()),
+                    Some(scratch_data.buffer.as_ref()),
+                    scratch_data.offset as usize,
+                );
+        }
+    }
+
+    fn build_top_level(
+        &mut self,
+        acceleration_structure: super::AccelerationStructure,
+        bottom_level: &[super::AccelerationStructure],
+        instance_count: u32,
+        instance_data: crate::BufferPiece,
+        scratch_data: crate::BufferPiece,
+    ) {
+        let mut primitive_acceleration_structures = Vec::with_capacity(bottom_level.len());
+        for blas in bottom_level {
+            primitive_acceleration_structures.push(blas.as_retained());
+        }
+        let descriptor = metal::MTLInstanceAccelerationStructureDescriptor::descriptor();
+        descriptor.setInstancedAccelerationStructures(Some(&NSArray::from_retained_slice(
+            &primitive_acceleration_structures,
+        )));
+        descriptor.setInstanceCount(instance_count as usize);
+        unsafe {
+            descriptor.setInstanceDescriptorType(
+                metal::MTLAccelerationStructureInstanceDescriptorType::UserID,
+            );
+            descriptor.setInstanceDescriptorBuffer(Some(instance_data.buffer.as_ref()));
+            descriptor.setInstanceDescriptorBufferOffset(instance_data.offset as usize);
+        }
+
+        self.raw
+            .buildAccelerationStructure_descriptor_scratchBuffer_scratchBufferOffset(
+                acceleration_structure.as_ref(),
+                &descriptor,
+                scratch_data.buffer.as_ref(),
+                scratch_data.offset as usize,
+            );
+
+        // Store BLAS pointers as an associated object on the TLAS so that
+        // `useResources` can be called automatically on bind.
+        let blas_ptrs: Vec<*mut _> = bottom_level.iter().map(|blas| blas.raw).collect();
+        let data = objc2_foundation::NSData::with_bytes(unsafe {
+            std::slice::from_raw_parts(
+                blas_ptrs.as_ptr() as *const u8,
+                blas_ptrs.len() * std::mem::size_of::<*mut ()>(),
+            )
+        });
+        unsafe {
+            objc2::ffi::objc_setAssociatedObject(
+                acceleration_structure.raw as *mut objc2::runtime::AnyObject,
+                &ASSOCIATED_BLAS_KEY as *const _ as *const std::ffi::c_void,
+                objc2::rc::Retained::as_ptr(&data) as *mut objc2::runtime::AnyObject,
+                objc2::ffi::OBJC_ASSOCIATION_RETAIN_NONATOMIC,
+            );
+        }
+    }
+}
+
+impl Drop for super::AccelerationStructureCommandEncoder<'_> {
+    fn drop(&mut self) {
+        self.raw.endEncoding();
+    }
+}
+
+impl super::ComputeCommandEncoder<'_> {
+    /// Insert a compute-to-compute memory barrier within the current pass.
+    ///
+    /// Ensures that storage buffer writes from preceding dispatches are
+    /// visible to subsequent dispatches without ending the compute encoder.
+    pub fn barrier(&mut self) {
+        // MTLBarrierScope.buffers = 1 << 0
+        // memoryBarrier(scope:) requires macOS 10.14+ / iOS 12.0+
+        unsafe {
+            let _: () = objc2::msg_send![&*self.raw, memoryBarrierWithScope: 1u64];
+        }
+    }
+
+    pub fn with<'p>(
+        &'p mut self,
+        pipeline: &'p super::ComputePipeline,
+    ) -> super::ComputePipelineContext<'p> {
+        if self.enable_debug_groups {
+            self.raw.pushDebugGroup(&NSString::from_str(&pipeline.name));
+        }
+        self.raw.setComputePipelineState(&pipeline.raw);
+        if let Some(index) = pipeline.layout.sizes_buffer_slot {
+            //TODO: get real sizes? shouldn't matter without bounds checks
+            let runtime_sizes = [0u8; 8];
+            unsafe {
+                self.raw.setBytes_length_atIndex(
+                    NonNull::new(runtime_sizes.as_ptr() as *const _ as *mut _).unwrap(),
+                    runtime_sizes.len(),
+                    index as _,
+                );
+            }
+        }
+        for (index, &size) in pipeline.wg_memory_sizes.iter().enumerate() {
+            unsafe {
+                self.raw
+                    .setThreadgroupMemoryLength_atIndex(size as _, index);
+            }
+        }
+
+        super::ComputePipelineContext {
+            encoder: self.raw.as_ref(),
+            wg_size: pipeline.wg_size,
+            group_mappings: &pipeline.layout.group_mappings,
+            enable_debug_groups: self.enable_debug_groups,
+        }
+    }
+}
+
+impl Drop for super::ComputeCommandEncoder<'_> {
+    fn drop(&mut self) {
+        self.raw.endEncoding();
+    }
+}
+
+impl crate::ScissorRect {
+    const fn to_metal(&self) -> metal::MTLScissorRect {
+        metal::MTLScissorRect {
+            x: self.x as _,
+            y: self.y as _,
+            width: self.w as _,
+            height: self.h as _,
+        }
+    }
+}
+impl crate::Viewport {
+    const fn to_metal(&self) -> metal::MTLViewport {
+        metal::MTLViewport {
+            originX: self.x as _,
+            originY: self.y as _,
+            width: self.w as _,
+            height: self.h as _,
+            znear: self.depth.start as _,
+            // TODO: broken on some Intel GPUs
+            // https://github.com/gfx-rs/wgpu/blob/ee3ae0e549fe01c4b699cf68f9b67ae8ea807564/wgpu-hal/src/metal/mod.rs#L298
+            zfar: self.depth.end as _,
+        }
+    }
+}
+
+#[hidden_trait::expose]
+impl crate::traits::RenderEncoder for super::RenderCommandEncoder<'_> {
+    fn set_scissor_rect(&mut self, rect: &crate::ScissorRect) {
+        self.raw.setScissorRect(rect.to_metal());
+    }
+
+    fn set_viewport(&mut self, viewport: &crate::Viewport) {
+        self.raw.setViewport(viewport.to_metal());
+    }
+
+    fn set_stencil_reference(&mut self, stencil_reference: u32) {
+        self.raw.setStencilReferenceValue(stencil_reference);
+    }
+}
+
+impl super::RenderCommandEncoder<'_> {
+    pub fn with<'p>(
+        &'p mut self,
+        pipeline: &'p super::RenderPipeline,
+    ) -> super::RenderPipelineContext<'p> {
+        if self.enable_debug_groups {
+            self.raw.pushDebugGroup(&NSString::from_str(&pipeline.name));
+        }
+        self.raw.setRenderPipelineState(&pipeline.raw);
+        if let Some(index) = pipeline.layout.sizes_buffer_slot {
+            //TODO: get real sizes
+            let runtime_sizes = [0u8; 8];
+            unsafe {
+                self.raw.setVertexBytes_length_atIndex(
+                    NonNull::new(runtime_sizes.as_ptr() as *const _ as *mut _).unwrap(),
+                    runtime_sizes.len(),
+                    index as _,
+                );
+                self.raw.setFragmentBytes_length_atIndex(
+                    NonNull::new(runtime_sizes.as_ptr() as *const _ as *mut _).unwrap(),
+                    runtime_sizes.len(),
+                    index as _,
+                );
+            }
+        }
+
+        self.raw.setFrontFacingWinding(pipeline.front_winding);
+        self.raw.setCullMode(pipeline.cull_mode);
+        self.raw.setTriangleFillMode(pipeline.triangle_fill_mode);
+        self.raw.setDepthClipMode(pipeline.depth_clip_mode);
+        if let Some((ref state, bias)) = pipeline.depth_stencil {
+            self.raw.setDepthStencilState(Some(state));
+            self.raw.setDepthBias_slopeScale_clamp(
+                bias.constant as f32,
+                bias.slope_scale,
+                bias.clamp,
+            );
+        }
+
+        super::RenderPipelineContext {
+            encoder: self.raw.as_ref(),
+            primitive_type: pipeline.primitive_type,
+            group_mappings: &pipeline.layout.group_mappings,
+            enable_debug_groups: self.enable_debug_groups,
+        }
+    }
+}
+
+impl Drop for super::RenderCommandEncoder<'_> {
+    fn drop(&mut self) {
+        self.raw.endEncoding();
+    }
+}
+
+#[hidden_trait::expose]
+impl crate::traits::PipelineEncoder for super::ComputePipelineContext<'_> {
+    fn bind<D: crate::ShaderData>(&mut self, group: u32, data: &D) {
+        let info = &self.group_mappings[group as usize];
+
+        data.fill(super::PipelineContext {
+            cs_encoder: if info.visibility.contains(crate::ShaderVisibility::COMPUTE) {
+                Some(self.encoder)
+            } else {
+                None
+            },
+            vs_encoder: None,
+            fs_encoder: None,
+            targets: &info.targets,
+            array_counts: &info.array_counts,
+            write_mask: info.write_mask,
+        });
+    }
+}
+
+#[hidden_trait::expose]
+impl crate::traits::ComputePipelineEncoder for super::ComputePipelineContext<'_> {
+    type BufferPiece = crate::BufferPiece;
+
+    fn dispatch(&mut self, groups: [u32; 3]) {
+        let raw_count = metal::MTLSize {
+            width: groups[0] as usize,
+            height: groups[1] as usize,
+            depth: groups[2] as usize,
+        };
+        self.encoder
+            .dispatchThreadgroups_threadsPerThreadgroup(raw_count, self.wg_size);
+    }
+
+    fn dispatch_indirect(&mut self, indirect_buf: crate::BufferPiece) {
+        unsafe {
+            self.encoder
+                .dispatchThreadgroupsWithIndirectBuffer_indirectBufferOffset_threadsPerThreadgroup(
+                    indirect_buf.buffer.as_ref(),
+                    indirect_buf.offset as usize,
+                    self.wg_size,
+                );
+        }
+    }
+}
+
+impl Drop for super::ComputePipelineContext<'_> {
+    fn drop(&mut self) {
+        if self.enable_debug_groups {
+            self.encoder.popDebugGroup();
+        }
+    }
+}
+
+#[hidden_trait::expose]
+impl crate::traits::PipelineEncoder for super::RenderPipelineContext<'_> {
+    fn bind<D: crate::ShaderData>(&mut self, group: u32, data: &D) {
+        let info = &self.group_mappings[group as usize];
+
+        data.fill(super::PipelineContext {
+            cs_encoder: None,
+            vs_encoder: if info.visibility.contains(crate::ShaderVisibility::VERTEX) {
+                Some(self.encoder)
+            } else {
+                None
+            },
+            fs_encoder: if info.visibility.contains(crate::ShaderVisibility::FRAGMENT) {
+                Some(self.encoder)
+            } else {
+                None
+            },
+            targets: &info.targets,
+            array_counts: &info.array_counts,
+            write_mask: info.write_mask,
+        });
+    }
+}
+
+#[hidden_trait::expose]
+impl crate::traits::RenderEncoder for super::RenderPipelineContext<'_> {
+    fn set_scissor_rect(&mut self, rect: &crate::ScissorRect) {
+        self.encoder.setScissorRect(rect.to_metal());
+    }
+    fn set_viewport(&mut self, viewport: &crate::Viewport) {
+        self.encoder.setViewport(viewport.to_metal());
+    }
+    fn set_stencil_reference(&mut self, stencil_reference: u32) {
+        self.encoder.setStencilReferenceValue(stencil_reference);
+    }
+}
+
+#[hidden_trait::expose]
+impl crate::traits::RenderPipelineEncoder for super::RenderPipelineContext<'_> {
+    type BufferPiece = crate::BufferPiece;
+
+    fn bind_vertex(&mut self, index: u32, vertex_buf: crate::BufferPiece) {
+        unsafe {
+            self.encoder.setVertexBuffer_offset_atIndex(
+                Some(vertex_buf.buffer.as_ref()),
+                vertex_buf.offset as usize,
+                index as usize,
+            );
+        }
+    }
+
+    fn draw(
+        &mut self,
+        first_vertex: u32,
+        vertex_count: u32,
+        first_instance: u32,
+        instance_count: u32,
+    ) {
+        unsafe {
+            if first_instance != 0 {
+                self.encoder
+                    .drawPrimitives_vertexStart_vertexCount_instanceCount_baseInstance(
+                        self.primitive_type,
+                        first_vertex as _,
+                        vertex_count as _,
+                        instance_count as _,
+                        first_instance as _,
+                    );
+            } else if instance_count != 1 {
+                self.encoder
+                    .drawPrimitives_vertexStart_vertexCount_instanceCount(
+                        self.primitive_type,
+                        first_vertex as _,
+                        vertex_count as _,
+                        instance_count as _,
+                    );
+            } else {
+                self.encoder.drawPrimitives_vertexStart_vertexCount(
+                    self.primitive_type,
+                    first_vertex as _,
+                    vertex_count as _,
+                );
+            }
+        }
+    }
+
+    fn draw_indexed(
+        &mut self,
+        index_buf: crate::BufferPiece,
+        index_type: crate::IndexType,
+        index_count: u32,
+        base_vertex: i32,
+        start_instance: u32,
+        instance_count: u32,
+    ) {
+        let raw_index_type = super::map_index_type(index_type);
+        unsafe {
+            if base_vertex != 0 || start_instance != 0 {
+                self.encoder
+                .drawIndexedPrimitives_indexCount_indexType_indexBuffer_indexBufferOffset_instanceCount_baseVertex_baseInstance(
+                    self.primitive_type,
+                    index_count as _,
+                    raw_index_type,
+                    index_buf.buffer.as_ref(),
+                    index_buf.offset as usize,
+                    instance_count as _,
+                    base_vertex as _,
+                    start_instance as _,
+                );
+            } else if instance_count != 1 {
+                self.encoder.drawIndexedPrimitives_indexCount_indexType_indexBuffer_indexBufferOffset_instanceCount(
+                self.primitive_type,
+                index_count as _,
+                raw_index_type,
+                index_buf.buffer.as_ref(),
+                index_buf.offset as usize,
+                instance_count as _,
+            );
+            } else {
+                self.encoder
+                    .drawIndexedPrimitives_indexCount_indexType_indexBuffer_indexBufferOffset(
+                        self.primitive_type,
+                        index_count as _,
+                        raw_index_type,
+                        index_buf.buffer.as_ref(),
+                        index_buf.offset as usize,
+                    );
+            }
+        }
+    }
+
+    fn draw_indirect(&mut self, indirect_buf: crate::BufferPiece) {
+        unsafe {
+            self.encoder
+                .drawPrimitives_indirectBuffer_indirectBufferOffset(
+                    self.primitive_type,
+                    indirect_buf.buffer.as_ref(),
+                    indirect_buf.offset as usize,
+                );
+        }
+    }
+
+    fn draw_indexed_indirect(
+        &mut self,
+        index_buf: crate::BufferPiece,
+        index_type: crate::IndexType,
+        indirect_buf: crate::BufferPiece,
+    ) {
+        let raw_index_type = super::map_index_type(index_type);
+        unsafe {
+            self.encoder.drawIndexedPrimitives_indexType_indexBuffer_indexBufferOffset_indirectBuffer_indirectBufferOffset(
+            self.primitive_type,
+            raw_index_type,
+            index_buf.buffer.as_ref(),
+            index_buf.offset as usize,
+            indirect_buf.buffer.as_ref(),
+            indirect_buf.offset as usize,
+        );
+        }
+    }
+}
+
+impl Drop for super::RenderPipelineContext<'_> {
+    fn drop(&mut self) {
+        if self.enable_debug_groups {
+            self.encoder.popDebugGroup();
+        }
+    }
+}
+
+fn map_origin(origin: &[u32; 3]) -> metal::MTLOrigin {
+    metal::MTLOrigin {
+        x: origin[0] as usize,
+        y: origin[1] as usize,
+        z: origin[2] as usize,
+    }
+}
+
+fn map_extent(extent: &crate::Extent) -> metal::MTLSize {
+    metal::MTLSize {
+        width: extent.width as usize,
+        height: extent.height as usize,
+        depth: extent.depth as usize,
+    }
+}
+
+fn map_clear_color(color: crate::TextureColor) -> metal::MTLClearColor {
+    match color {
+        crate::TextureColor::TransparentBlack => metal::MTLClearColor {
+            red: 0.0,
+            green: 0.0,
+            blue: 0.0,
+            alpha: 0.0,
+        },
+        crate::TextureColor::OpaqueBlack => metal::MTLClearColor {
+            red: 0.0,
+            green: 0.0,
+            blue: 0.0,
+            alpha: 1.0,
+        },
+        crate::TextureColor::White => metal::MTLClearColor {
+            red: 1.0,
+            green: 1.0,
+            blue: 1.0,
+            alpha: 1.0,
+        },
+    }
+}

@@ -1,0 +1,47 @@
+[workspace]
+resolver = "2"
+exclude = ["vendor"]
+members = [
+    "crates/ferritic-core",
+    "crates/ferritic-text",
+    "crates/ferritic-blade",
+    "crates/ferritic-winit",
+    "crates/ferritic-macros",
+    "crates/ferritic",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+rust-version = "1.92"
+
+[workspace.dependencies]
+ferritic-core = { path = "crates/ferritic-core" }
+ferritic-text = { path = "crates/ferritic-text" }
+ferritic-blade = { path = "crates/ferritic-blade" }
+ferritic-winit = { path = "crates/ferritic-winit" }
+
+# The blade main branch, copied into the workspace so that it is pinned and
+# stable while the upstream checkout switches branches.
+blade-graphics = { path = "vendor/blade-ferritic/blade-graphics" }
+blade-macros = { path = "vendor/blade-ferritic/blade-macros" }
+blade-util = { path = "vendor/blade-ferritic/blade-util" }
+
+bytemuck = { version = "1", features = ["derive"] }
+log = "0.4"
+raw-window-handle = "0.6"
+# MIT-only dependency policy: the default `wayland-csd-adwaita` feature pulls
+# the Apache-2.0-only ab_glyph chain. Keep the same feature set as the
+# blade-ferritic branch.
+winit = { version = "0.30", default-features = false, features = [
+    "rwh_06",
+    "x11",
+    "wayland",
+    "wayland-dlopen",
+] }
+fontdb = "0.23"
+swash = "0.2"
+proc-macro2 = "=1.0.107"
+quote = "=1.0.47"
+syn = { version = "=2.0.119", features = ["full"] }

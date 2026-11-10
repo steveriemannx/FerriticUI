@@ -1,0 +1,22 @@
+[package]
+name = "blade-egui"
+version = "0.9.0"
+edition = "2024"
+rust-version = "1.92"
+description = "egui integration for Blade"
+keywords = ["graphics"]
+license = "MIT"
+repository = "https://github.com/kvark/blade"
+
+[lib]
+
+[dependencies]
+blade-graphics = { workspace = true }
+blade-macros = { workspace = true }
+blade-util = { workspace = true }
+egui = { workspace = true, features = ["bytemuck"] }
+bytemuck = { workspace = true }
+profiling = { workspace = true }
+
+[package.metadata.cargo_check_external_types]
+allowed_external_types = ["blade_graphics::*", "epaint::*"]

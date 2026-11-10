@@ -1,0 +1,2575 @@
+#![allow(
+    irrefutable_let_patterns,
+    clippy::new_without_default,
+    // Conflicts with `pattern_type_mismatch`
+    clippy::needless_borrowed_reference,
+    // The GLES context is thread-affine, while the native contexts sharing the
+    // same engine storage are Send + Sync.
+    clippy::arc_with_non_send_sync,
+)]
+#![warn(
+    trivial_casts,
+    trivial_numeric_casts,
+    unused_extern_crates,
+    unused_qualifications,
+    // We don't match on a reference, unless required.
+    clippy::pattern_type_mismatch,
+)]
+
+use blade_graphics as gpu;
+use std::{
+    ops,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+pub use blade_asset::vfs;
+
+mod animation;
+pub mod config;
+mod trimesh;
+
+pub use animation::{
+    AnimationChannel, AnimationClip, AnimationInterpolation, AnimationModel, AnimationPlayer,
+    AnimationProperty,
+};
+pub use blade_particle;
+
+const ZERO_V3: mint::Vector3<f32> = mint::Vector3 {
+    x: 0.0,
+    y: 0.0,
+    z: 0.0,
+};
+
+const GPU_TIMING_SAMPLE_PERIOD: Duration = Duration::from_secs(1);
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Transform {
+    pub position: mint::Vector3<f32>,
+    pub orientation: mint::Quaternion<f32>,
+}
+
+impl Default for Transform {
+    fn default() -> Self {
+        Self {
+            position: ZERO_V3,
+            orientation: mint::Quaternion { s: 1.0, v: ZERO_V3 },
+        }
+    }
+}
+impl Transform {
+    fn from_pose(pose: rapier3d::math::Pose) -> Self {
+        Self {
+            position: pose.translation.into(),
+            orientation: pose.rotation.into(),
+        }
+    }
+    fn into_pose(self) -> rapier3d::math::Pose {
+        rapier3d::math::Pose::from_parts(self.position.into(), self.orientation.into())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct BoundingBox {
+    pub center: mint::Vector3<f32>,
+    pub half: mint::Vector3<f32>,
+}
+
+/// Type of prediction to be made about the object transformation.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub enum Prediction {
+    /// Report the last known transform. It always makes sense,
+    /// but it could be out of date.
+    #[default]
+    LastKnown,
+    /// Integrate using velocity only.
+    IntegrateVelocity,
+    /// Integrate using velocity and forces affecting the object.
+    IntegrateVelocityAndForces,
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub enum DynamicInput {
+    /// Object is not controllable, it's static.
+    Empty,
+    /// Object is controlled by user setting the position.
+    SetPosition,
+    /// Object is controlled by user setting the velocity.
+    SetVelocity,
+    /// Object is affected by all forces around.
+    #[default]
+    Full,
+}
+impl DynamicInput {
+    fn into_rapier(self) -> rapier3d::dynamics::RigidBodyType {
+        use rapier3d::dynamics::RigidBodyType as Rbt;
+        match self {
+            Self::Empty => Rbt::Fixed,
+            Self::SetPosition => Rbt::KinematicPositionBased,
+            Self::SetVelocity => Rbt::KinematicVelocityBased,
+            Self::Full => Rbt::Dynamic,
+        }
+    }
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum JointAxis {
+    LinearX = 0,
+    LinearY = 1,
+    LinearZ = 2,
+    AngularX = 3,
+    AngularY = 4,
+    AngularZ = 5,
+}
+impl JointAxis {
+    fn into_rapier(self) -> rapier3d::dynamics::JointAxis {
+        use rapier3d::dynamics::JointAxis as Ja;
+        match self {
+            Self::LinearX => Ja::LinX,
+            Self::LinearY => Ja::LinY,
+            Self::LinearZ => Ja::LinZ,
+            Self::AngularX => Ja::AngX,
+            Self::AngularY => Ja::AngY,
+            Self::AngularZ => Ja::AngZ,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct JointHandle(JointHandleInner);
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum JointHandleInner {
+    Soft(rapier3d::dynamics::ImpulseJointHandle),
+    Hard(rapier3d::dynamics::MultibodyJointHandle),
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FreedomAxis {
+    pub limits: Option<ops::Range<f32>>,
+    pub motor: Option<config::Motor>,
+}
+
+impl FreedomAxis {
+    pub const FREE: Self = Self {
+        limits: None,
+        motor: None,
+    };
+    pub const ALL_FREE: mint::Vector3<Option<Self>> = mint::Vector3 {
+        x: Some(Self::FREE),
+        y: Some(Self::FREE),
+        z: Some(Self::FREE),
+    };
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct JointDesc {
+    pub parent_anchor: Transform,
+    pub child_anchor: Transform,
+    pub linear: mint::Vector3<Option<FreedomAxis>>,
+    pub angular: mint::Vector3<Option<FreedomAxis>>,
+    /// Allow the contacts to happen between A and B
+    pub allow_contacts: bool,
+    /// Hard joints guarantee the releation between
+    /// objects, while soft joints only try to get there.
+    pub is_hard: bool,
+}
+impl Default for JointDesc {
+    fn default() -> Self {
+        Self {
+            parent_anchor: Transform::default(),
+            child_anchor: Transform::default(),
+            linear: mint::Vector3 {
+                x: None,
+                y: None,
+                z: None,
+            },
+            angular: mint::Vector3 {
+                x: None,
+                y: None,
+                z: None,
+            },
+            allow_contacts: false,
+            is_hard: false,
+        }
+    }
+}
+
+/// A contact event between two physics objects.
+#[derive(Clone, Debug)]
+pub struct ContactEvent {
+    pub object_a: ObjectHandle,
+    pub object_b: ObjectHandle,
+    /// World-space contact point (average of contact manifold points).
+    pub position: mint::Vector3<f32>,
+}
+
+const MAX_DEPTH: f32 = 1e9;
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Hash)]
+pub struct ObjectHandle(usize);
+
+/// Opaque handle used to inspect, update, or remove a registered local light.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Hash)]
+pub struct LightHandle(usize);
+
+fn make_quaternion(degrees: mint::Vector3<f32>) -> glam::Quat {
+    // Degrees are roll (x), pitch (y), yaw (z).
+    glam::Quat::from_euler(
+        glam::EulerRot::ZYX,
+        degrees.z.to_radians(),
+        degrees.y.to_radians(),
+        degrees.x.to_radians(),
+    )
+}
+
+fn make_render_transform(matrix: glam::Mat4) -> gpu::Transform {
+    let columns = mint::ColumnMatrix3x4 {
+        x: matrix.x_axis.truncate().into(),
+        y: matrix.y_axis.truncate().into(),
+        z: matrix.z_axis.truncate().into(),
+        w: matrix.w_axis.truncate().into(),
+    };
+    mint::RowMatrix3x4::from(columns)
+}
+
+fn render_transform(pose: &rapier3d::math::Pose, similarity: glam::Affine3A) -> gpu::Transform {
+    make_render_transform(pose.to_mat4() * glam::Mat4::from(similarity))
+}
+
+fn static_trimesh_flags() -> rapier3d::geometry::TriMeshFlags {
+    // Shared triangle edges are not real surface features. Pseudo-normal correction
+    // prevents rounded dynamic shapes from catching on an otherwise smooth mesh.
+    rapier3d::geometry::TriMeshFlags::FIX_INTERNAL_EDGES
+}
+
+trait UiValue {
+    fn value(&mut self, v: f32);
+    fn value_vec3(&mut self, v3: glam::Vec3) {
+        self.value(v3.x);
+        self.value(v3.y);
+        self.value(v3.z);
+    }
+}
+impl UiValue for egui::Ui {
+    fn value(&mut self, v: f32) {
+        self.colored_label(egui::Color32::WHITE, format!("{v:.1}"));
+    }
+}
+
+#[cfg_attr(target_os = "android", allow(dead_code))]
+#[derive(Default)]
+struct DebugPhysicsRender {
+    lines: Vec<blade_render::DebugLine>,
+}
+impl rapier3d::pipeline::DebugRenderBackend for DebugPhysicsRender {
+    fn draw_line(
+        &mut self,
+        _object: rapier3d::pipeline::DebugRenderObject,
+        a: rapier3d::math::Vector,
+        b: rapier3d::math::Vector,
+        color: [f32; 4],
+    ) {
+        // Looks like everybody encodes HSL(A) differently...
+        let hsl = colorsys::Hsl::new(
+            color[0] as f64,
+            color[1] as f64 * 100.0,
+            color[2] as f64 * 100.0,
+            None,
+        );
+        let rgb = colorsys::Rgb::from(&hsl);
+        let color = [
+            rgb.red(),
+            rgb.green(),
+            rgb.blue(),
+            color[3].clamp(0.0, 1.0) as f64 * 255.0,
+        ]
+        .iter()
+        .rev()
+        .fold(0u32, |u, &c| (u << 8) | c as u32);
+        self.lines.push(blade_render::DebugLine {
+            a: blade_render::DebugPoint {
+                pos: a.to_array(),
+                color,
+            },
+            b: blade_render::DebugPoint {
+                pos: b.to_array(),
+                color,
+            },
+        });
+    }
+}
+
+#[derive(Default)]
+struct Physics {
+    rigid_bodies: rapier3d::dynamics::RigidBodySet,
+    integration_params: rapier3d::dynamics::IntegrationParameters,
+    island_manager: rapier3d::dynamics::IslandManager,
+    impulse_joints: rapier3d::dynamics::ImpulseJointSet,
+    multibody_joints: rapier3d::dynamics::MultibodyJointSet,
+    solver: rapier3d::dynamics::CCDSolver,
+    soft_bodies: rapier3d::dynamics::SoftBodySet,
+    colliders: rapier3d::geometry::ColliderSet,
+    broad_phase: rapier3d::geometry::DefaultBroadPhase,
+    narrow_phase: rapier3d::geometry::NarrowPhase,
+    gravity: rapier3d::math::Vector,
+    pipeline: rapier3d::pipeline::PhysicsPipeline,
+    debug_pipeline: rapier3d::pipeline::DebugRenderPipeline,
+    last_time: f32,
+}
+
+impl Physics {
+    fn step(&mut self) {
+        let physics_hooks = ();
+        let event_handler = ();
+        self.pipeline.step(
+            self.gravity,
+            &self.integration_params,
+            &mut self.island_manager,
+            &mut self.broad_phase,
+            &mut self.narrow_phase,
+            &mut self.rigid_bodies,
+            &mut self.colliders,
+            &mut self.impulse_joints,
+            &mut self.multibody_joints,
+            &mut self.soft_bodies,
+            &mut self.solver,
+            &physics_hooks,
+            &event_handler,
+        );
+        self.last_time += self.integration_params.dt;
+    }
+    #[cfg_attr(target_os = "android", allow(dead_code))]
+    fn render_debug(&mut self) -> Vec<blade_render::DebugLine> {
+        let mut backend = DebugPhysicsRender::default();
+        self.debug_pipeline.render(
+            &mut backend,
+            &self.rigid_bodies,
+            &self.colliders,
+            &self.impulse_joints,
+            &self.multibody_joints,
+            &self.narrow_phase,
+            &self.soft_bodies,
+        );
+        backend.lines
+    }
+}
+
+#[doc(hidden)]
+impl ops::Index<JointHandle> for Physics {
+    type Output = rapier3d::dynamics::GenericJoint;
+    fn index(&self, handle: JointHandle) -> &Self::Output {
+        match handle.0 {
+            JointHandleInner::Soft(h) => &self.impulse_joints.get(h).unwrap().data,
+            JointHandleInner::Hard(h) => {
+                let (multibody, link_index) = self.multibody_joints.get(h).unwrap();
+                &multibody.link(link_index).unwrap().joint.data
+            }
+        }
+    }
+}
+impl ops::IndexMut<JointHandle> for Physics {
+    fn index_mut(&mut self, handle: JointHandle) -> &mut Self::Output {
+        match handle.0 {
+            JointHandleInner::Soft(h) => &mut self.impulse_joints.get_mut(h, true).unwrap().data,
+            JointHandleInner::Hard(h) => {
+                let (multibody, link_index) = self.multibody_joints.get_mut(h).unwrap();
+                &mut multibody.link_mut(link_index).unwrap().joint.data
+            }
+        }
+    }
+}
+
+struct Visual {
+    model: blade_asset::Handle<blade_render::Model>,
+    animation_model: Option<blade_asset::Handle<AnimationModel>>,
+    similarity: glam::Affine3A,
+}
+
+struct Object {
+    name: String,
+    rigid_body: rapier3d::dynamics::RigidBodyHandle,
+    colliders: Vec<rapier3d::geometry::ColliderHandle>,
+    visuals: Vec<Visual>,
+    color_tint: [f32; 4],
+    animation: Option<AnimationPlayer>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct FrameCamera {
+    pub transform: Transform,
+    pub fov_y: f32,
+}
+
+impl From<blade_render::Camera> for FrameCamera {
+    fn from(cam: blade_render::Camera) -> Self {
+        Self {
+            transform: Transform {
+                position: cam.pos,
+                orientation: cam.rot,
+            },
+            fov_y: cam.fov_y,
+        }
+    }
+}
+
+#[allow(clippy::large_enum_variant)]
+enum Renderer {
+    RayTracer {
+        inner: blade_render::RayTracer,
+        frame_config: blade_render::FrameConfig,
+        ray_config: blade_render::RayConfig,
+        mode: blade_render::RenderMode,
+        denoiser_enabled: bool,
+        denoiser_config: blade_render::DenoiserConfig,
+        post_proc_config: blade_render::PostProcConfig,
+    },
+    Rasterizer {
+        inner: blade_render::Rasterizer,
+        raster_config: blade_render::RasterConfig,
+    },
+}
+
+impl Renderer {
+    fn destroy(&mut self, gpu: &gpu::Context) {
+        match *self {
+            Self::RayTracer { ref mut inner, .. } => inner.destroy(gpu),
+            Self::Rasterizer { ref mut inner, .. } => inner.destroy(gpu),
+        }
+    }
+
+    fn surface_size(&self) -> gpu::Extent {
+        match *self {
+            Self::RayTracer { ref inner, .. } => inner.get_surface_size(),
+            Self::Rasterizer { ref inner, .. } => inner.get_surface_size(),
+        }
+    }
+
+    fn hot_reload(
+        &mut self,
+        asset_hub: &blade_render::AssetHub,
+        gpu: &gpu::Context,
+        sync_point: &gpu::SyncPoint,
+    ) {
+        match *self {
+            Self::RayTracer { ref mut inner, .. } => {
+                inner.hot_reload(asset_hub, gpu, sync_point);
+            }
+            Self::Rasterizer { ref mut inner, .. } => {
+                inner.hot_reload(asset_hub, gpu, sync_point);
+            }
+        }
+    }
+
+    fn resize_screen(
+        &mut self,
+        size: gpu::Extent,
+        encoder: &mut gpu::CommandEncoder,
+        gpu: &gpu::Context,
+    ) {
+        match *self {
+            Self::RayTracer {
+                ref mut inner,
+                ref mut frame_config,
+                ..
+            } => {
+                inner.resize_screen(size, encoder, gpu);
+                frame_config.reset_reservoirs = true;
+            }
+            Self::Rasterizer { ref mut inner, .. } => inner.resize_screen(size, encoder, gpu),
+        }
+    }
+
+    fn reset_scene_history(&mut self) {
+        if let Self::RayTracer {
+            ref mut frame_config,
+            ..
+        } = *self
+        {
+            frame_config.reset_reservoirs = true;
+            frame_config.reset_accumulation = true;
+        }
+    }
+}
+
+pub enum Presentation<'a> {
+    #[cfg(not(target_os = "android"))]
+    Window(&'a winit::window::Window),
+    Xr(gpu::XrDesc),
+    #[cfg(target_os = "android")]
+    #[doc(hidden)]
+    __Marker(std::marker::PhantomData<&'a ()>),
+}
+
+#[allow(clippy::large_enum_variant)]
+enum TargetSurface {
+    #[cfg(not(target_os = "android"))]
+    Window(gpu::Surface),
+    #[cfg(target_os = "android")]
+    Xr(gpu::XrSurface),
+}
+
+/// Blade Engine encapsulates all the context for applications,
+/// such as the GPU context, Ray-tracing context, EGUI integration,
+/// asset hub, physics context, task processing, and more.
+pub struct Engine {
+    pacer: blade_render::util::FramePacer,
+    renderer: Renderer,
+    physics: Physics,
+    load_tasks: Vec<choir::RunningTask>,
+    gui_painter: Option<blade_egui::GuiPainter>,
+    asset_hub: blade_render::AssetHub,
+    animation_models: blade_asset::AssetManager<animation::Baker>,
+    target_surface: TargetSurface,
+    gpu_context: Arc<gpu::Context>,
+    environment_map: Option<blade_asset::Handle<blade_render::Texture>>,
+    objects: slab::Slab<Object>,
+    local_lights: slab::Slab<blade_render::LocalLight>,
+    render_local_lights: Vec<blade_render::LocalLight>,
+    selected_object_handle: Option<ObjectHandle>,
+    selected_collider: Option<rapier3d::geometry::ColliderHandle>,
+    render_objects: Vec<blade_render::Object>,
+    retired_render_objects: Vec<blade_render::Object>,
+    debug: blade_render::DebugConfig,
+    extra_debug_lines: Vec<blade_render::DebugLine>,
+    contact_events: Vec<ContactEvent>,
+    particle_pipeline: Option<blade_particle::ParticlePipeline>,
+    particle_systems: slab::Slab<blade_particle::ParticleSystem>,
+    surface_info: gpu::SurfaceInfo,
+    track_hot_reloads: bool,
+    workers: Vec<choir::WorkerHandle>,
+    choir: Arc<choir::Choir>,
+    data_path: String,
+    time_ahead: f32,
+    particle_clock: f32,
+    last_particle_clock: f32,
+    gpu_timing: Vec<(String, Duration)>,
+    gpu_timing_sampled: Instant,
+}
+
+impl Engine {
+    #[cfg(not(target_os = "android"))]
+    fn make_surface_config(physical_size: winit::dpi::PhysicalSize<u32>) -> gpu::SurfaceConfig {
+        gpu::SurfaceConfig {
+            size: gpu::Extent {
+                width: physical_size.width.max(1),
+                height: physical_size.height.max(1),
+                depth: 1,
+            },
+            usage: gpu::TextureUsage::TARGET,
+            //TODO: make it `Recent`
+            display_sync: gpu::DisplaySync::Block,
+            color_space: gpu::ColorSpace::Linear,
+            transparent: false,
+            allow_exclusive_full_screen: true,
+        }
+    }
+
+    fn hot_reload_if_needed(&mut self) {
+        if !self.track_hot_reloads {
+            return;
+        }
+        let sync_point = self.pacer.last_sync_point().unwrap();
+        self.renderer
+            .hot_reload(&self.asset_hub, &self.gpu_context, sync_point);
+    }
+
+    fn update_render_objects(
+        physics: &Physics,
+        objects: &slab::Slab<Object>,
+        render_objects: &mut [blade_render::Object],
+        animation_models: &blade_asset::AssetManager<animation::Baker>,
+        time_ahead: f32,
+    ) {
+        let mut render_objects = render_objects.iter_mut();
+        for (_, object) in objects {
+            let pose = physics
+                .rigid_bodies
+                .get(object.rigid_body)
+                .unwrap()
+                .predict_position_using_velocity_and_forces(time_ahead);
+            let animation_name = object.animation.and_then(|animation| {
+                object.visuals.iter().find_map(|visual| {
+                    let model = animation_models.get(visual.animation_model?)?;
+                    model
+                        .clips
+                        .get(animation.clip_index)
+                        .filter(|clip| !clip.name.is_empty())
+                        .map(|clip| clip.name.as_str())
+                })
+            });
+
+            for visual in &object.visuals {
+                let current_pose = object.animation.and_then(|mut animation| {
+                    let model = animation_models.get(visual.animation_model?)?;
+                    if let Some(name) = animation_name {
+                        animation.clip_index = model.animation_index(name)?;
+                    }
+                    animation.pose(model)
+                });
+                let Some(render_object) = render_objects.next() else {
+                    log::error!(
+                        "Object '{}' has {} visuals but only {} render objects were prepared",
+                        object.name,
+                        object.visuals.len(),
+                        render_objects.len()
+                    );
+                    return;
+                };
+                render_object.model = visual.model;
+                render_object.transform = render_transform(&pose, visual.similarity);
+                render_object.color_tint = object.color_tint;
+                render_object.pose = current_pose;
+            }
+        }
+        debug_assert!(render_objects.next().is_none());
+    }
+
+    fn render_object_range(objects: &slab::Slab<Object>, object_index: usize) -> ops::Range<usize> {
+        let start = objects
+            .iter()
+            .take_while(|&(index, _)| index < object_index)
+            .map(|(_, object)| object.visuals.len())
+            .sum();
+        let count = objects[object_index].visuals.len();
+        start..start + count
+    }
+
+    fn insert_render_objects(
+        physics: &Physics,
+        objects: &slab::Slab<Object>,
+        render_objects: &mut Vec<blade_render::Object>,
+        object_index: usize,
+    ) {
+        let range = Self::render_object_range(objects, object_index);
+        let object = &objects[object_index];
+        let pose = physics.rigid_bodies[object.rigid_body].position();
+        let additions = object.visuals.iter().map(|visual| {
+            let mut render_object = blade_render::Object::from(visual.model);
+            render_object.transform = render_transform(pose, visual.similarity);
+            render_object.prev_transform = render_object.transform;
+            render_object.color_tint = object.color_tint;
+            render_object
+        });
+        render_objects.splice(range.start..range.start, additions);
+    }
+
+    fn flush_assets_and_check_ready(
+        asset_hub: &blade_render::AssetHub,
+        load_tasks: &mut Vec<choir::RunningTask>,
+        command_encoder: &mut gpu::CommandEncoder,
+        temp: &mut blade_render::FrameResources,
+        run_tasks_inline: bool,
+    ) -> bool {
+        asset_hub.flush(command_encoder, &mut temp.buffers);
+        load_tasks.retain(|task| !task.is_done());
+        if run_tasks_inline {
+            for task in load_tasks.iter() {
+                task.join_active();
+            }
+            load_tasks.retain(|task| !task.is_done());
+        }
+        load_tasks.is_empty()
+    }
+
+    fn asset_cache_path(config: &config::Engine) -> PathBuf {
+        PathBuf::from(&config.cache_path)
+    }
+
+    #[profiling::function]
+    pub fn new(presentation: Presentation<'_>, config: &config::Engine) -> Self {
+        log::info!("Initializing the engine");
+
+        #[allow(unreachable_code)]
+        let xr = match presentation {
+            #[cfg(not(target_os = "android"))]
+            Presentation::Window(_) => None,
+            Presentation::Xr(ref xr_desc) => Some(xr_desc.clone()),
+            #[cfg(target_os = "android")]
+            Presentation::__Marker(_) => unreachable!(),
+        };
+        let mut render_backend = config.render_backend;
+        let mut context_desc = gpu::ContextDesc {
+            presentation: xr.is_none(),
+            xr,
+            ray_tracing: config.render_backend.uses_ray_tracing(),
+            validation: cfg!(debug_assertions),
+            timing: gpu::Context::enumerate().ok().is_some_and(|reports| {
+                reports.iter().any(|report| {
+                    matches!(
+                        &report.status,
+                        gpu::DeviceReportStatus::Available { caps, .. } if caps.timing
+                    )
+                })
+            }),
+            ..Default::default()
+        };
+        let gpu_context = match unsafe { gpu::Context::init(context_desc.clone()) } {
+            Ok(context) => Arc::new(context),
+            Err(error) if context_desc.ray_tracing => {
+                log::warn!("Unable to initialize ray tracing ({error}); using rasterizer");
+                render_backend = config::RenderBackend::Rasterizer;
+                context_desc.ray_tracing = false;
+                Arc::new(unsafe { gpu::Context::init(context_desc).unwrap() })
+            }
+            Err(error) => panic!("Unable to initialize graphics: {error}"),
+        };
+        render_backend = match render_backend {
+            config::RenderBackend::RayTracer
+                if {
+                    let caps = gpu_context.capabilities();
+                    !caps.ray_query.contains(gpu::ShaderVisibility::COMPUTE) || !caps.binding_array
+                } =>
+            {
+                log::warn!("Ray queries or binding arrays are unavailable; using rasterizer");
+                config::RenderBackend::Rasterizer
+            }
+            backend => backend,
+        };
+
+        // Note: the color space we ask the surface for is also the one
+        // the renderers have to produce, see `RenderConfig`.
+        let (surface_size, surface_info, color_space, target_surface) = match presentation {
+            #[cfg(not(target_os = "android"))]
+            Presentation::Window(window) => {
+                let surface_config = Self::make_surface_config(window.inner_size());
+                let surface_size = surface_config.size;
+                let gpu_surface = gpu_context
+                    .create_surface_configured(window, surface_config)
+                    .unwrap();
+                let surface_info = gpu_surface.info();
+                (
+                    surface_size,
+                    surface_info,
+                    surface_config.color_space,
+                    TargetSurface::Window(gpu_surface),
+                )
+            }
+            #[allow(unreachable_code)]
+            Presentation::Xr(_) => {
+                #[cfg(not(target_os = "android"))]
+                panic!("XR presentation is only supported on Android");
+                #[cfg(target_os = "android")]
+                {
+                    let surface_config = gpu_context
+                        .xr_recommended_surface_config(
+                            openxr::ViewConfigurationType::PRIMARY_STEREO,
+                        )
+                        .expect("Unable to query the XR surface configuration");
+                    let xr_surface = gpu_context
+                        .create_xr_surface_configured(surface_config)
+                        .expect("Unable to create XR surface from GPU context");
+                    let surface_size = xr_surface.extent();
+                    let surface_info = xr_surface.info();
+                    (
+                        surface_size,
+                        surface_info,
+                        surface_config.color_space,
+                        TargetSurface::Xr(xr_surface),
+                    )
+                }
+            }
+            #[cfg(target_os = "android")]
+            Presentation::__Marker(_) => unreachable!(),
+        };
+
+        let choir = choir::Choir::new();
+        #[cfg(not(any(gles, target_arch = "wasm32")))]
+        let workers = {
+            let num_workers = num_cpus::get_physical().max((num_cpus::get() * 3 + 2) / 4);
+            log::info!("Initializing Choir with {} workers", num_workers);
+            (0..num_workers)
+                .map(|i| choir.add_worker(&format!("Worker-{i}")))
+                .collect::<Vec<_>>()
+        };
+        #[cfg(any(gles, target_arch = "wasm32"))]
+        let workers = {
+            log::info!("Choir tasks will run on the graphics context's owning thread");
+            Vec::new()
+        };
+
+        let asset_cache_path = Self::asset_cache_path(config);
+        let asset_hub = blade_render::AssetHub::new(&asset_cache_path, &choir, &gpu_context);
+        let animation_models =
+            blade_asset::AssetManager::new(&asset_cache_path, &choir, animation::Baker);
+        let (shaders, shader_task) = blade_render::Shaders::load(
+            config.shader_path.as_ref(),
+            &asset_hub,
+            render_backend.uses_ray_tracing(),
+        );
+
+        log::info!("Spinning up the renderer");
+        if workers.is_empty() {
+            shader_task.join_active();
+        } else {
+            shader_task.join();
+        }
+        let mut pacer = blade_render::util::FramePacer::new(&gpu_context);
+        let (command_encoder, _) = pacer.begin_frame();
+
+        let render_config = blade_render::RenderConfig {
+            surface_size,
+            surface_info,
+            color_space,
+            max_debug_lines: 1 << 14,
+        };
+        let renderer = match render_backend {
+            config::RenderBackend::RayTracer => Renderer::RayTracer {
+                inner: blade_render::RayTracer::new(
+                    command_encoder,
+                    &gpu_context,
+                    shaders,
+                    &asset_hub.shaders,
+                    &render_config,
+                ),
+                frame_config: blade_render::FrameConfig {
+                    frozen: false,
+                    debug_draw: true,
+                    reset_variance: false,
+                    reset_reservoirs: true,
+                    reset_accumulation: true,
+                },
+                ray_config: blade_helpers::default_ray_config(),
+                mode: blade_render::RenderMode::default(),
+                denoiser_enabled: true,
+                denoiser_config: blade_render::DenoiserConfig {
+                    num_passes: 4,
+                    temporal_weight: 0.1,
+                },
+                post_proc_config: blade_render::PostProcConfig {
+                    average_luminocity: 0.5,
+                    exposure_key_value: 1.0 / 9.6,
+                    white_level: 1.0,
+                    tone_map: true,
+                },
+            },
+            config::RenderBackend::Rasterizer => Renderer::Rasterizer {
+                inner: blade_render::Rasterizer::new(
+                    command_encoder,
+                    &gpu_context,
+                    shaders,
+                    &asset_hub.shaders,
+                    &render_config,
+                ),
+                raster_config: blade_render::RasterConfig::default(),
+            },
+        };
+
+        pacer.end_frame(&gpu_context);
+
+        let gui_painter = if config.gui_enabled {
+            Some(blade_egui::GuiPainter::new(surface_info, &gpu_context))
+        } else {
+            None
+        };
+        let mut physics = Physics::default();
+        physics.debug_pipeline.mode = rapier3d::pipeline::DebugRenderMode::empty();
+        physics.integration_params.dt = config.time_step;
+
+        Self {
+            pacer,
+            renderer,
+            physics,
+            load_tasks: Vec::new(),
+            gui_painter,
+            asset_hub,
+            animation_models,
+            target_surface,
+            gpu_context,
+            environment_map: None,
+            objects: slab::Slab::new(),
+            local_lights: slab::Slab::new(),
+            render_local_lights: Vec::new(),
+            selected_object_handle: None,
+            selected_collider: None,
+            render_objects: Vec::new(),
+            retired_render_objects: Vec::new(),
+            debug: blade_render::DebugConfig::default(),
+            extra_debug_lines: Vec::new(),
+            contact_events: Vec::new(),
+            particle_pipeline: None,
+            particle_systems: slab::Slab::new(),
+            surface_info,
+            track_hot_reloads: false,
+            workers,
+            choir,
+            data_path: config.data_path.clone(),
+            time_ahead: 0.0,
+            particle_clock: 0.0,
+            last_particle_clock: 0.0,
+            gpu_timing: Vec::new(),
+            gpu_timing_sampled: Instant::now()
+                .checked_sub(GPU_TIMING_SAMPLE_PERIOD)
+                .unwrap_or_else(Instant::now),
+        }
+    }
+
+    pub fn destroy(&mut self) {
+        self.workers.clear();
+        self.pacer.destroy(&self.gpu_context);
+        if let Some(gui_painter) = self.gui_painter.take() {
+            let mut painter = gui_painter;
+            painter.destroy(&self.gpu_context);
+        }
+        match self.target_surface {
+            #[cfg(not(target_os = "android"))]
+            TargetSurface::Window(ref mut surface) => {
+                self.gpu_context.destroy_surface(surface);
+            }
+            #[cfg(target_os = "android")]
+            TargetSurface::Xr(ref mut xr_surface) => {
+                self.gpu_context.destroy_xr_surface(xr_surface);
+            }
+        }
+        for object in self.render_objects.iter_mut() {
+            object.destroy_gpu(&self.gpu_context);
+        }
+        for object in self.retired_render_objects.iter_mut() {
+            object.destroy_gpu(&self.gpu_context);
+        }
+        self.objects.clear();
+        self.renderer.destroy(&self.gpu_context);
+        self.animation_models.clear();
+        for mut ps in self.particle_systems.drain() {
+            ps.destroy(&self.gpu_context);
+        }
+        if let Some(mut pp) = self.particle_pipeline.take() {
+            pp.destroy(&self.gpu_context);
+        }
+        self.asset_hub.destroy();
+    }
+
+    #[profiling::function]
+    pub fn update(&mut self, dt: f32) {
+        self.choir.check_panic();
+        self.particle_clock += dt;
+        for (_, object) in self.objects.iter_mut() {
+            if let Some(ref mut animation) = object.animation {
+                animation.advance(dt);
+            }
+        }
+        self.time_ahead += dt;
+        while self.time_ahead >= self.physics.integration_params.dt {
+            self.physics.step();
+            self.time_ahead -= self.physics.integration_params.dt;
+        }
+        // Collect contact events from the narrow phase
+        self.contact_events.clear();
+        for pair in self.physics.narrow_phase.contact_pairs() {
+            if !pair.has_any_active_contact() {
+                continue;
+            }
+            // Map collider → rigid body → ObjectHandle via user_data
+            let (rb_a, object_a) = match self.physics.colliders.get(pair.collider1) {
+                Some(c) => match c.parent().and_then(|rb| self.physics.rigid_bodies.get(rb)) {
+                    Some(rb) => (rb, ObjectHandle(rb.user_data as usize)),
+                    None => continue,
+                },
+                None => continue,
+            };
+            let object_b = match self.physics.colliders.get(pair.collider2) {
+                Some(c) => match c.parent().and_then(|rb| self.physics.rigid_bodies.get(rb)) {
+                    Some(rb) => ObjectHandle(rb.user_data as usize),
+                    None => continue,
+                },
+                None => continue,
+            };
+            // Average contact point position in world space.
+            // local_p1 is in collider1's rigid body local frame.
+            let rb_pos_a = *rb_a.position();
+            let mut avg_pos = glam::Vec3::ZERO;
+            let mut count = 0u32;
+            for manifold in pair.manifolds() {
+                for pt in manifold.contacts() {
+                    let local_pt = manifold
+                        .subshape_pos1()
+                        .map(|pose| pose.transform_point(pt.local_p1))
+                        .unwrap_or(pt.local_p1);
+                    avg_pos += rb_pos_a.transform_point(local_pt);
+                    count += 1;
+                }
+            }
+            if count == 0 {
+                continue;
+            }
+            avg_pos /= count as f32;
+            self.contact_events.push(ContactEvent {
+                object_a,
+                object_b,
+                position: avg_pos.into(),
+            });
+        }
+    }
+
+    fn take_particle_dt(&mut self) -> f32 {
+        let dt = (self.particle_clock - self.last_particle_clock).clamp(0.0, 0.05);
+        self.last_particle_clock = self.particle_clock;
+        dt
+    }
+
+    /// Drain contact events from the last physics update.
+    pub fn drain_contacts(&mut self) -> impl Iterator<Item = ContactEvent> + '_ {
+        self.contact_events.drain(..)
+    }
+
+    /// Override rasterizer lighting/material configuration.
+    /// Has no effect when the ray-tracer backend is active.
+    pub fn set_raster_config(&mut self, config: blade_render::RasterConfig) {
+        if let Renderer::Rasterizer {
+            ref mut inner,
+            ref mut raster_config,
+        } = self.renderer
+        {
+            if let Some(shadows) = config.directional_shadows {
+                let requested = shadows.resolution.clamp(256, 4096);
+                if requested != inner.directional_shadow_resolution() {
+                    // Shadow-map replacement must not race the preceding frame.
+                    self.pacer.wait_for_previous_frame(&self.gpu_context);
+                    inner.set_directional_shadow_resolution(requested, &self.gpu_context);
+                }
+            }
+            *raster_config = config;
+        }
+    }
+
+    fn rebuild_render_local_lights(&mut self) {
+        self.render_local_lights.clear();
+        self.render_local_lights.extend(
+            self.local_lights
+                .iter()
+                .take(blade_render::MAX_LOCAL_LIGHTS)
+                .map(|(_, light)| *light),
+        );
+    }
+
+    /// Register a local point or spot light and return its handle.
+    ///
+    /// Local lights currently affect the raster renderer only. The renderer
+    /// considers at most [`blade_render::MAX_LOCAL_LIGHTS`] registered lights.
+    pub fn add_light(&mut self, light: blade_render::LocalLight) -> LightHandle {
+        let handle = LightHandle(self.local_lights.insert(light));
+        self.rebuild_render_local_lights();
+        handle
+    }
+
+    /// Get a registered local light.
+    pub fn light(&self, handle: LightHandle) -> Option<&blade_render::LocalLight> {
+        self.local_lights.get(handle.0)
+    }
+
+    /// Replace a registered local light, returning whether the handle was valid.
+    pub fn set_light(&mut self, handle: LightHandle, light: blade_render::LocalLight) -> bool {
+        let Some(slot) = self.local_lights.get_mut(handle.0) else {
+            return false;
+        };
+        *slot = light;
+        self.rebuild_render_local_lights();
+        true
+    }
+
+    /// Remove a registered local light, returning whether the handle was valid.
+    pub fn remove_light(&mut self, handle: LightHandle) -> bool {
+        if !self.local_lights.contains(handle.0) {
+            return false;
+        }
+        self.local_lights.remove(handle.0);
+        self.rebuild_render_local_lights();
+        true
+    }
+
+    #[profiling::function]
+    #[cfg(not(target_os = "android"))]
+    pub fn render(
+        &mut self,
+        camera: &FrameCamera,
+        gui_primitives: &[egui::ClippedPrimitive],
+        gui_textures: &egui::TexturesDelta,
+        physical_size: winit::dpi::PhysicalSize<u32>,
+        scale_factor: f32,
+    ) {
+        let particle_dt = self.take_particle_dt();
+        self.hot_reload_if_needed();
+
+        // Note: the resize is split in 2 parts because `wait_for_previous_frame`
+        // wants to borrow `self` mutably, and `command_encoder` blocks that.
+        let surface_config = Self::make_surface_config(physical_size);
+        let new_render_size = surface_config.size;
+        let current_render_size = self.renderer.surface_size();
+        if new_render_size != current_render_size {
+            log::info!("Resizing to {}", new_render_size);
+            self.pacer.wait_for_previous_frame(&self.gpu_context);
+            match self.target_surface {
+                TargetSurface::Window(ref mut surface) => {
+                    self.gpu_context
+                        .reconfigure_surface(surface, surface_config);
+                }
+                #[cfg(target_os = "android")]
+                _ => panic!("Engine::render is only available with TargetSurface::Window"),
+            }
+        }
+
+        let (command_encoder, temp) = self.pacer.begin_frame();
+        if new_render_size != current_render_size {
+            self.renderer
+                .resize_screen(new_render_size, command_encoder, &self.gpu_context);
+        }
+        if let Renderer::RayTracer {
+            ref mut frame_config,
+            ..
+        } = self.renderer
+        {
+            frame_config.reset_variance = self.debug.mouse_pos.is_none();
+        }
+        if let Some(ref mut painter) = self.gui_painter {
+            painter.update_textures(command_encoder, gui_textures, &self.gpu_context);
+        }
+        let can_render = Self::flush_assets_and_check_ready(
+            &self.asset_hub,
+            &mut self.load_tasks,
+            command_encoder,
+            temp,
+            self.workers.is_empty(),
+        );
+
+        // We should be able to update TLAS and render content
+        // even while it's still being loaded.
+        if can_render {
+            for mut render_object in self.retired_render_objects.drain(..) {
+                render_object.retire_gpu(temp);
+            }
+            Self::update_render_objects(
+                &self.physics,
+                &self.objects,
+                &mut self.render_objects,
+                &self.animation_models,
+                self.time_ahead,
+            );
+            if let Renderer::RayTracer {
+                ref mut inner,
+                ref mut frame_config,
+                ref mut ray_config,
+                ref mut denoiser_enabled,
+                ref mut denoiser_config,
+                mode,
+                ..
+            } = self.renderer
+            {
+                inner.build_scene(
+                    command_encoder,
+                    &mut self.render_objects,
+                    self.environment_map,
+                    &self.asset_hub,
+                    &self.gpu_context,
+                    temp,
+                );
+                inner.prepare(
+                    command_encoder,
+                    &blade_render::Camera {
+                        pos: camera.transform.position,
+                        rot: camera.transform.orientation,
+                        fov_y: camera.fov_y,
+                        depth: MAX_DEPTH,
+                        fov: None,
+                    },
+                    *frame_config,
+                );
+                frame_config.reset_reservoirs = false;
+                frame_config.reset_accumulation = false;
+
+                if !self.render_objects.is_empty() {
+                    inner.render(
+                        command_encoder,
+                        mode,
+                        self.debug,
+                        *ray_config,
+                        denoiser_enabled.then_some(*denoiser_config),
+                    );
+                }
+            }
+        }
+
+        if particle_dt > 0.0
+            && let Some(ref pipeline) = self.particle_pipeline
+        {
+            for (_, system) in self.particle_systems.iter_mut() {
+                system.update(pipeline, command_encoder, particle_dt);
+            }
+        }
+
+        let mut debug_lines = self.physics.render_debug();
+        if let Some(handle) = self.selected_object_handle {
+            let object = &self.objects[handle.0];
+            let rb = self.physics.rigid_bodies.get(object.rigid_body).unwrap();
+            for (_, joint) in self.physics.impulse_joints.iter() {
+                let local_frame = if joint.body1() == object.rigid_body {
+                    joint.data.local_frame1
+                } else if joint.body2() == object.rigid_body {
+                    joint.data.local_frame2
+                } else {
+                    continue;
+                };
+                let position = rb.position() * local_frame;
+                let length = 1.0;
+                let base = blade_render::DebugPoint {
+                    pos: position.translation.to_array(),
+                    color: 0xFFFFFF,
+                };
+                debug_lines.push(blade_render::DebugLine {
+                    a: base,
+                    b: blade_render::DebugPoint {
+                        pos: position.transform_point(glam::Vec3::X * length).to_array(),
+                        color: 0x0000FF,
+                    },
+                });
+                debug_lines.push(blade_render::DebugLine {
+                    a: base,
+                    b: blade_render::DebugPoint {
+                        pos: position.transform_point(glam::Vec3::Y * length).to_array(),
+                        color: 0x00FF00,
+                    },
+                });
+                debug_lines.push(blade_render::DebugLine {
+                    a: base,
+                    b: blade_render::DebugPoint {
+                        pos: position.transform_point(glam::Vec3::Z * length).to_array(),
+                        color: 0xFF0000,
+                    },
+                });
+            }
+        }
+
+        let frame = match self.target_surface {
+            TargetSurface::Window(ref mut surface) => surface.acquire_frame(),
+            #[cfg(target_os = "android")]
+            _ => panic!("Engine::render is only available with TargetSurface::Window"),
+        };
+        command_encoder.init_texture(frame.texture());
+
+        match self.renderer {
+            Renderer::RayTracer {
+                ref mut inner,
+                ref post_proc_config,
+                ..
+            } => {
+                if let mut pass = command_encoder.render(
+                    "draw",
+                    gpu::RenderTargetSet {
+                        colors: &[gpu::RenderTarget {
+                            view: frame.texture_view(),
+                            init_op: gpu::InitOp::Clear(gpu::TextureColor::TransparentBlack),
+                            finish_op: gpu::FinishOp::Store,
+                        }],
+                        depth_stencil: None,
+                    },
+                ) {
+                    let screen_desc = blade_egui::ScreenDescriptor {
+                        physical_size: (physical_size.width, physical_size.height),
+                        scale_factor,
+                    };
+                    if can_render {
+                        inner.post_proc(
+                            &mut pass,
+                            self.debug,
+                            *post_proc_config,
+                            &debug_lines,
+                            &[],
+                        );
+                    }
+                    if let Some(ref mut painter) = self.gui_painter {
+                        painter.paint(&mut pass, gui_primitives, &screen_desc, &self.gpu_context);
+                    }
+                }
+            }
+            Renderer::Rasterizer {
+                ref mut inner,
+                ref raster_config,
+            } => {
+                let render_camera = blade_render::Camera {
+                    pos: camera.transform.position,
+                    rot: camera.transform.orientation,
+                    fov_y: camera.fov_y,
+                    depth: MAX_DEPTH,
+                    fov: None,
+                };
+                if can_render {
+                    inner.prepare(
+                        command_encoder,
+                        &mut self.render_objects,
+                        &self.asset_hub,
+                        &self.gpu_context,
+                        temp,
+                    );
+                    inner.render_directional_shadows(
+                        command_encoder,
+                        &render_camera,
+                        &self.render_objects,
+                        &self.asset_hub,
+                        raster_config,
+                    );
+                }
+                command_encoder.init_texture(inner.depth_texture());
+                {
+                    let mut pass = command_encoder.render(
+                        "raster",
+                        gpu::RenderTargetSet {
+                            colors: &[gpu::RenderTarget {
+                                view: frame.texture_view(),
+                                init_op: gpu::InitOp::Clear(raster_config.clear_color),
+                                finish_op: gpu::FinishOp::Store,
+                            }],
+                            depth_stencil: Some(gpu::RenderTarget {
+                                view: inner.depth_view(),
+                                init_op: gpu::InitOp::Clear(gpu::TextureColor::White),
+                                finish_op: gpu::FinishOp::Store,
+                            }),
+                        },
+                    );
+                    if can_render {
+                        inner.render(
+                            &mut pass,
+                            &render_camera,
+                            &self.render_objects,
+                            &self.asset_hub,
+                            self.environment_map,
+                            &self.render_local_lights,
+                            raster_config,
+                        );
+                        if let Some(ref pipeline) = self.particle_pipeline {
+                            let target_size = gpu::Extent {
+                                width: physical_size.width,
+                                height: physical_size.height,
+                                depth: 1,
+                            };
+                            let particle_camera =
+                                Self::make_particle_camera(&render_camera, target_size);
+                            for (_, system) in self.particle_systems.iter() {
+                                system.draw(pipeline, &mut pass, &particle_camera);
+                            }
+                        }
+                    }
+                }
+
+                // GUI is a dev-only overlay, so a separate pass keeps the raster path simpler.
+                if self.gui_painter.is_some()
+                    && let mut pass = command_encoder.render(
+                        "gui",
+                        gpu::RenderTargetSet {
+                            colors: &[gpu::RenderTarget {
+                                view: frame.texture_view(),
+                                init_op: gpu::InitOp::Load,
+                                finish_op: gpu::FinishOp::Store,
+                            }],
+                            depth_stencil: None,
+                        },
+                    )
+                {
+                    inner.render_debug_lines(&mut pass, &render_camera, &debug_lines);
+                    let screen_desc = blade_egui::ScreenDescriptor {
+                        physical_size: (physical_size.width, physical_size.height),
+                        scale_factor,
+                    };
+                    if let Some(ref mut painter) = self.gui_painter {
+                        painter.paint(&mut pass, gui_primitives, &screen_desc, &self.gpu_context);
+                    }
+                }
+            }
+        }
+
+        command_encoder.present(frame);
+        let sync_point = self.pacer.end_frame(&self.gpu_context);
+        if let Some(ref mut painter) = self.gui_painter {
+            painter.after_submit(sync_point);
+        }
+        if can_render {
+            for object in &mut self.render_objects {
+                object.flip();
+            }
+        }
+
+        profiling::finish_frame!();
+    }
+
+    #[cfg(target_os = "android")]
+    /// Render a stereo XR frame and present it through the owned XR surface.
+    ///
+    /// Returns `false` when the runtime indicates the frame should not be
+    /// rendered (for example while transitioning session state).
+    #[profiling::function]
+    pub fn render_xr(&mut self) -> bool {
+        let particle_dt = self.take_particle_dt();
+        self.hot_reload_if_needed();
+
+        let xr_surface = match self.target_surface {
+            TargetSurface::Xr(ref mut xr_surface) => xr_surface,
+            #[cfg(not(target_os = "android"))]
+            _ => panic!("Engine::render_xr is only available with TargetSurface::Xr"),
+        };
+        let frame = match xr_surface.acquire_frame(&self.gpu_context) {
+            Some(frame) => frame,
+            None => return false,
+        };
+
+        let target_size = xr_surface.extent();
+        let view_count = frame.xr_view_count() as usize;
+
+        let (command_encoder, temp) = self.pacer.begin_frame();
+        self.renderer
+            .resize_screen(target_size, command_encoder, &self.gpu_context);
+        if let Renderer::RayTracer {
+            ref mut frame_config,
+            ..
+        } = self.renderer
+        {
+            frame_config.reset_variance = self.debug.mouse_pos.is_none();
+        }
+
+        let can_render = Self::flush_assets_and_check_ready(
+            &self.asset_hub,
+            &mut self.load_tasks,
+            command_encoder,
+            temp,
+            self.workers.is_empty(),
+        );
+
+        if can_render {
+            for mut render_object in self.retired_render_objects.drain(..) {
+                render_object.retire_gpu(temp);
+            }
+            Self::update_render_objects(
+                &self.physics,
+                &self.objects,
+                &mut self.render_objects,
+                &self.animation_models,
+                self.time_ahead,
+            );
+        }
+
+        // Update particle systems (compute passes)
+        if particle_dt > 0.0
+            && let Some(ref pipeline) = self.particle_pipeline
+        {
+            for (_, system) in self.particle_systems.iter_mut() {
+                system.update(pipeline, command_encoder, particle_dt);
+            }
+        }
+
+        command_encoder.init_texture(frame.texture());
+
+        match self.renderer {
+            //Note: the canonical renderer is of no use in a headset,
+            // so XR always takes the real-time path.
+            Renderer::RayTracer {
+                ref mut inner,
+                ray_config,
+                ref mut frame_config,
+                denoiser_enabled,
+                denoiser_config,
+                post_proc_config,
+                ..
+            } => {
+                let mode = blade_render::RenderMode::RealTime;
+                if can_render {
+                    inner.build_scene(
+                        command_encoder,
+                        &mut self.render_objects,
+                        self.environment_map,
+                        &self.asset_hub,
+                        &self.gpu_context,
+                        temp,
+                    );
+                }
+                // Current ray path is monoscopic in engine terms. For XR we render
+                // each eye independently by re-preparing camera state per-eye.
+                for eye in 0..view_count {
+                    let xr_view = frame.xr_view(eye as u32);
+                    let render_camera = blade_render::Camera {
+                        pos: xr_view.pose.position.into(),
+                        rot: mint::Quaternion {
+                            s: xr_view.pose.orientation[3],
+                            v: mint::Vector3 {
+                                x: xr_view.pose.orientation[0],
+                                y: xr_view.pose.orientation[1],
+                                z: xr_view.pose.orientation[2],
+                            },
+                        },
+                        fov_y: xr_view.fov.angle_up - xr_view.fov.angle_down,
+                        depth: MAX_DEPTH,
+                        fov: Some(blade_render::Fov {
+                            left: (-xr_view.fov.angle_left).max(0.0),
+                            right: xr_view.fov.angle_right.max(0.0),
+                            up: xr_view.fov.angle_up.max(0.0),
+                            down: (-xr_view.fov.angle_down).max(0.0),
+                        }),
+                    };
+                    inner.prepare(command_encoder, &render_camera, *frame_config);
+                    frame_config.reset_reservoirs = false;
+                    frame_config.reset_accumulation = false;
+                    if !self.render_objects.is_empty() {
+                        inner.render(
+                            command_encoder,
+                            mode,
+                            self.debug,
+                            ray_config,
+                            denoiser_enabled.then_some(denoiser_config),
+                        );
+                    }
+                    if let mut pass = command_encoder.render(
+                        "xr-draw",
+                        gpu::RenderTargetSet {
+                            colors: &[gpu::RenderTarget {
+                                view: frame.xr_texture_view(eye as u32),
+                                init_op: gpu::InitOp::Clear(gpu::TextureColor::TransparentBlack),
+                                finish_op: gpu::FinishOp::Store,
+                            }],
+                            depth_stencil: None,
+                        },
+                    ) {
+                        if can_render {
+                            inner.post_proc(&mut pass, self.debug, post_proc_config, &[], &[]);
+                        }
+                    }
+                }
+            }
+            Renderer::Rasterizer {
+                ref mut inner,
+                ref raster_config,
+            } => {
+                if can_render {
+                    inner.prepare(
+                        command_encoder,
+                        &mut self.render_objects,
+                        &self.asset_hub,
+                        &self.gpu_context,
+                        temp,
+                    );
+                }
+                command_encoder.init_texture(inner.depth_texture());
+                for eye in 0..view_count {
+                    let xr_view = frame.xr_view(eye as u32);
+                    let render_camera = blade_render::Camera {
+                        pos: xr_view.pose.position.into(),
+                        rot: mint::Quaternion {
+                            s: xr_view.pose.orientation[3],
+                            v: mint::Vector3 {
+                                x: xr_view.pose.orientation[0],
+                                y: xr_view.pose.orientation[1],
+                                z: xr_view.pose.orientation[2],
+                            },
+                        },
+                        fov_y: xr_view.fov.angle_up - xr_view.fov.angle_down,
+                        depth: MAX_DEPTH,
+                        fov: Some(blade_render::Fov {
+                            left: (-xr_view.fov.angle_left).max(0.0),
+                            right: xr_view.fov.angle_right.max(0.0),
+                            up: xr_view.fov.angle_up.max(0.0),
+                            down: (-xr_view.fov.angle_down).max(0.0),
+                        }),
+                    };
+                    if can_render {
+                        inner.render_directional_shadows(
+                            command_encoder,
+                            &render_camera,
+                            &self.render_objects,
+                            &self.asset_hub,
+                            raster_config,
+                        );
+                    }
+                    if let mut pass = command_encoder.render(
+                        "xr-raster",
+                        gpu::RenderTargetSet {
+                            colors: &[gpu::RenderTarget {
+                                view: frame.xr_texture_view(eye as u32),
+                                init_op: gpu::InitOp::Clear(raster_config.clear_color),
+                                finish_op: gpu::FinishOp::Store,
+                            }],
+                            depth_stencil: Some(gpu::RenderTarget {
+                                view: inner.depth_view(),
+                                init_op: gpu::InitOp::Clear(gpu::TextureColor::White),
+                                finish_op: gpu::FinishOp::Store,
+                            }),
+                        },
+                    ) {
+                        if can_render {
+                            inner.render(
+                                &mut pass,
+                                &render_camera,
+                                &self.render_objects,
+                                &self.asset_hub,
+                                self.environment_map,
+                                &self.render_local_lights,
+                                raster_config,
+                            );
+                        }
+                        inner.render_debug_lines(
+                            &mut pass,
+                            &render_camera,
+                            &self.extra_debug_lines,
+                        );
+                        // Draw particle systems
+                        if let Some(ref pipeline) = self.particle_pipeline {
+                            let particle_camera =
+                                Self::make_particle_camera(&render_camera, target_size);
+                            for (_, system) in self.particle_systems.iter() {
+                                system.draw(pipeline, &mut pass, &particle_camera);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        self.extra_debug_lines.clear();
+        command_encoder.present(frame);
+        self.pacer.end_frame(&self.gpu_context);
+        if can_render {
+            for object in &mut self.render_objects {
+                object.flip();
+            }
+        }
+        profiling::finish_frame!();
+        true
+    }
+
+    #[cfg(target_os = "android")]
+    pub fn begin_xr(&self) {
+        use openxr as xr;
+        match self.target_surface {
+            TargetSurface::Xr(_) => {}
+            #[cfg(not(target_os = "android"))]
+            TargetSurface::Window(_) => {
+                panic!("Engine::begin_xr is only available with Presentation::Xr")
+            }
+        }
+        self.gpu_context
+            .xr_session()
+            .expect("XR session is unavailable")
+            .begin(xr::ViewConfigurationType::PRIMARY_STEREO)
+            .unwrap();
+    }
+
+    #[cfg(target_os = "android")]
+    pub fn end_xr(&self) {
+        match self.target_surface {
+            TargetSurface::Xr(_) => {}
+            #[cfg(not(target_os = "android"))]
+            TargetSurface::Window(_) => {
+                panic!("Engine::end_xr is only available with Presentation::Xr")
+            }
+        }
+        self.gpu_context
+            .xr_session()
+            .expect("XR session is unavailable")
+            .end()
+            .unwrap();
+    }
+
+    /// Get the XR session handle for creating action sets, actions, and action spaces.
+    #[cfg(target_os = "android")]
+    pub fn xr_session(&self) -> Option<openxr::Session<openxr::Vulkan>> {
+        self.gpu_context.xr_session()
+    }
+
+    /// Locate an action space (e.g. controller aim) relative to the XR reference space.
+    #[cfg(target_os = "android")]
+    pub fn xr_locate_space(&self, action_space: &openxr::Space) -> Option<openxr::Posef> {
+        self.gpu_context.xr_locate_space(action_space)
+    }
+
+    /// Add debug lines to be rendered this frame (consumed after rendering).
+    pub fn add_debug_lines(&mut self, lines: &[blade_render::DebugLine]) {
+        self.extra_debug_lines.extend_from_slice(lines);
+    }
+
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    fn make_particle_camera(
+        camera: &blade_render::Camera,
+        target_size: gpu::Extent,
+    ) -> blade_particle::CameraParams {
+        let pos = glam::Vec3::from(camera.pos);
+        let rot = glam::Quat::from(camera.rot);
+        let view = glam::Mat4::from_rotation_translation(rot, pos).inverse();
+        let near = 0.01f32;
+        let far = camera.depth;
+        let proj = if let Some(fov) = camera.fov {
+            let left = -fov.left.tan() * near;
+            let right = fov.right.tan() * near;
+            let bottom = -fov.down.tan() * near;
+            let top = fov.up.tan() * near;
+            let w = right - left;
+            let h = top - bottom;
+            glam::Mat4::from_cols(
+                glam::Vec4::new(2.0 * near / w, 0.0, 0.0, 0.0),
+                glam::Vec4::new(0.0, 2.0 * near / h, 0.0, 0.0),
+                glam::Vec4::new(
+                    (right + left) / w,
+                    (top + bottom) / h,
+                    far / (near - far),
+                    -1.0,
+                ),
+                glam::Vec4::new(0.0, 0.0, far * near / (near - far), 0.0),
+            )
+        } else {
+            let aspect = target_size.width as f32 / target_size.height.max(1) as f32;
+            glam::camera::rh::proj::directx::perspective(camera.fov_y, aspect, near, far)
+        };
+        let view_proj = proj * view;
+        // Camera right and up in world space for billboarding
+        let right = rot * glam::Vec3::X;
+        let up = rot * glam::Vec3::Y;
+        blade_particle::CameraParams {
+            view_proj: view_proj.to_cols_array(),
+            camera_right: [right.x, right.y, right.z, 0.0],
+            camera_up: [up.x, up.y, up.z, 0.0],
+        }
+    }
+
+    /// Create a particle system from an effect definition.
+    /// Returns a handle that can be used to trigger bursts or remove the system.
+    pub fn create_particle_system(
+        &mut self,
+        name: &str,
+        effect: &blade_particle::ParticleEffect,
+    ) -> usize {
+        if !self.gpu_context.capabilities().compute {
+            log::warn!("Particle compute is not available on this graphics device");
+            return usize::MAX;
+        }
+        let pipeline = self.particle_pipeline.get_or_insert_with(|| {
+            blade_particle::ParticlePipeline::new(
+                &self.gpu_context,
+                blade_particle::PipelineDesc {
+                    name: "particles",
+                    draw_format: self.surface_info.format,
+                    depth_format: Some(gpu::TextureFormat::Depth32Float),
+                    sample_count: 1,
+                },
+            )
+        });
+        let system = pipeline.create_system(&self.gpu_context, name, effect);
+        self.particle_systems.insert(system)
+    }
+
+    /// Trigger a burst of particles at a world position.
+    pub fn particle_burst(&mut self, handle: usize, count: u32, position: [f32; 3]) {
+        if handle == usize::MAX {
+            return;
+        }
+        if let Some(system) = self.particle_systems.get_mut(handle) {
+            system.burst(count, position);
+        }
+    }
+
+    /// Remove a particle system and free its GPU resources.
+    pub fn remove_particle_system(&mut self, handle: usize) {
+        if self.particle_systems.contains(handle) {
+            let mut system = self.particle_systems.remove(handle);
+            system.destroy(&self.gpu_context);
+        }
+    }
+
+    /// Get a mutable reference to a particle system.
+    pub fn particle_system_mut(
+        &mut self,
+        handle: usize,
+    ) -> Option<&mut blade_particle::ParticleSystem> {
+        self.particle_systems.get_mut(handle)
+    }
+
+    #[profiling::function]
+    pub fn populate_hud(&mut self, ui: &mut egui::Ui) {
+        use blade_helpers::ExposeHud as _;
+
+        let mut selection = blade_render::SelectionInfo::default();
+        if self.debug.mouse_pos.is_some()
+            && let Renderer::RayTracer { ref mut inner, .. } = self.renderer
+        {
+            selection = inner.read_debug_selection_info();
+            self.selected_object_handle = self.find_object(selection.custom_index);
+        }
+
+        ui.checkbox(&mut self.track_hot_reloads, "Hot reloading");
+
+        egui::CollapsingHeader::new("Rendering")
+            .default_open(false)
+            .show(ui, |ui| match self.renderer {
+                Renderer::RayTracer {
+                    ref mut mode,
+                    ref mut ray_config,
+                    ref mut denoiser_enabled,
+                    ref mut denoiser_config,
+                    ref mut post_proc_config,
+                    ref mut frame_config,
+                    ..
+                } => {
+                    if blade_helpers::populate_render_mode(mode, ui) {
+                        frame_config.reset_accumulation = true;
+                    }
+                    ray_config.populate_hud(ui);
+                    let reset = ui.button("Reset Accumulation").clicked();
+                    frame_config.reset_reservoirs |= reset;
+                    frame_config.reset_accumulation |= reset;
+                    ui.checkbox(denoiser_enabled, "Enable Denoiser");
+                    denoiser_config.populate_hud(ui);
+                    post_proc_config.populate_hud(ui);
+                }
+                Renderer::Rasterizer {
+                    ref mut raster_config,
+                    ..
+                } => {
+                    raster_config.populate_hud(ui);
+                }
+            });
+        egui::CollapsingHeader::new("Debug")
+            .default_open(true)
+            .show(ui, |ui| match self.renderer {
+                Renderer::RayTracer { .. } => {
+                    self.debug.populate_hud(ui);
+                    blade_helpers::populate_debug_selection(
+                        &mut self.debug.mouse_pos,
+                        &selection,
+                        &self.asset_hub,
+                        ui,
+                    );
+                }
+                Renderer::Rasterizer { .. } => {
+                    ui.label("Ray-tracing debug views are not available in raster mode.");
+                }
+            });
+
+        egui::CollapsingHeader::new("Visualize")
+            .default_open(false)
+            .show(ui, |ui| {
+                let all_bits = rapier3d::pipeline::DebugRenderMode::all().bits();
+                let mut bit_pos = 0u32;
+                while (1u32 << bit_pos) <= all_bits {
+                    let flag = match rapier3d::pipeline::DebugRenderMode::from_bits(1 << bit_pos) {
+                        Some(flag) => flag,
+                        None => {
+                            bit_pos += 1;
+                            continue;
+                        }
+                    };
+                    let mut enabled = self.physics.debug_pipeline.mode.contains(flag);
+                    ui.checkbox(&mut enabled, format!("{flag:?}"));
+                    self.physics.debug_pipeline.mode.set(flag, enabled);
+                    bit_pos += 1;
+                }
+            });
+
+        egui::CollapsingHeader::new("Performance").show(ui, |ui| {
+            if self.gpu_context.capabilities().timing
+                && self.gpu_timing_sampled.elapsed() >= GPU_TIMING_SAMPLE_PERIOD
+            {
+                if let Some(sp) = self.pacer.last_sync_point() {
+                    let _ = self.gpu_context.wait_for(sp, !0);
+                    self.gpu_timing = self
+                        .pacer
+                        .last_timing()
+                        .pass_durations()
+                        .map(|(name, duration)| (name.to_string(), duration))
+                        .collect();
+                }
+                self.gpu_timing_sampled = Instant::now();
+            }
+            for &(ref name, duration) in self.gpu_timing.iter() {
+                let millis = duration.as_secs_f32() * 1000.0;
+                ui.horizontal(|ui| {
+                    ui.label(name);
+                    ui.colored_label(egui::Color32::WHITE, format!("{:.2} ms", millis));
+                });
+            }
+        });
+
+        egui::CollapsingHeader::new("Objects")
+            .default_open(true)
+            .show(ui, |ui| {
+                for (handle, object) in self.objects.iter() {
+                    ui.selectable_value(
+                        &mut self.selected_object_handle,
+                        Some(ObjectHandle(handle)),
+                        &object.name,
+                    );
+                }
+
+                if let Some(handle) = self.selected_object_handle {
+                    let object = &self.objects[handle.0];
+                    let rigid_body = &mut self.physics.rigid_bodies[object.rigid_body];
+                    if ui.button("Unselect").clicked() {
+                        self.selected_object_handle = None;
+                        self.selected_collider = None;
+                    }
+                    egui::CollapsingHeader::new("Stats")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label("Position:");
+                                ui.value_vec3(rigid_body.translation());
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Linear velocity:");
+                                ui.value_vec3(rigid_body.linvel());
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Linear Damping:");
+                                ui.value(rigid_body.linear_damping());
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Angular velocity:");
+                                ui.value_vec3(rigid_body.angvel());
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Angular Damping:");
+                                ui.value(rigid_body.angular_damping());
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Kinematic energy:");
+                                ui.value(rigid_body.kinetic_energy());
+                            });
+                        });
+                    ui.heading("Colliders");
+                    for &collider_handle in rigid_body.colliders() {
+                        let collider = &self.physics.colliders[collider_handle];
+                        let name = format!("{:?}", collider.shape().shape_type());
+                        ui.selectable_value(
+                            &mut self.selected_collider,
+                            Some(collider_handle),
+                            name,
+                        );
+                    }
+                }
+
+                if let Some(collider_handle) = self.selected_collider {
+                    ui.heading("Properties");
+                    let collider = self.physics.colliders.get_mut(collider_handle).unwrap();
+                    let mut density = collider.density();
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut density)
+                                .prefix("Density: ")
+                                .range(0.1..=1e6),
+                        )
+                        .changed()
+                    {
+                        collider.set_density(density);
+                    }
+                    let mut friction = collider.friction();
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut friction)
+                                .prefix("Friction: ")
+                                .range(0.0..=5.0)
+                                .speed(0.01),
+                        )
+                        .changed()
+                    {
+                        collider.set_friction(friction);
+                    }
+                    let mut restitution = collider.restitution();
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut restitution)
+                                .prefix("Restituion: ")
+                                .range(0.0..=1.0)
+                                .speed(0.01),
+                        )
+                        .changed()
+                    {
+                        collider.set_restitution(restitution);
+                    }
+                }
+            });
+    }
+
+    pub fn screen_aspect(&self) -> f32 {
+        let size = self.renderer.surface_size();
+        size.width as f32 / size.height.max(1) as f32
+    }
+
+    fn find_object(&self, geometry_index: u32) -> Option<ObjectHandle> {
+        let mut index = geometry_index as usize;
+        for (obj_handle, object) in self.objects.iter() {
+            for visual in object.visuals.iter() {
+                let model = &self.asset_hub.models[visual.model];
+                match index.checked_sub(model.geometries.len()) {
+                    Some(i) => index = i,
+                    None => return Some(ObjectHandle(obj_handle)),
+                }
+            }
+        }
+        None
+    }
+
+    pub fn add_object(
+        &mut self,
+        config: &config::Object,
+        transform: Transform,
+        dynamic_input: DynamicInput,
+    ) -> ObjectHandle {
+        use rapier3d::{dynamics::MassProperties, geometry::ColliderBuilder};
+
+        let mut visuals = Vec::new();
+        for visual in config.visuals.iter() {
+            let path = format!("{}/{}", self.data_path, visual.model);
+            let (model, task) = self.asset_hub.models.load(
+                &path,
+                blade_render::model::Meta {
+                    generate_tangents: true,
+                    front_face: match visual.front_face {
+                        config::FrontFace::Cw => blade_render::model::FrontFace::Clockwise,
+                        config::FrontFace::Ccw => blade_render::model::FrontFace::CounterClockwise,
+                    },
+                },
+            );
+            visuals.push(Visual {
+                model,
+                // Loaded lazily by `set_animation`.
+                animation_model: None,
+                similarity: glam::Affine3A::from_scale_rotation_translation(
+                    glam::Vec3::splat(visual.scale),
+                    make_quaternion(visual.rot),
+                    visual.pos.into(),
+                ),
+            });
+            self.load_tasks.push(task.clone());
+        }
+
+        let add_mass_properties = match config.additional_mass {
+            Some(ref am) => match am.shape {
+                config::Shape::Ball { radius } => MassProperties::from_ball(am.density, radius),
+                config::Shape::Cylinder {
+                    half_height,
+                    radius,
+                } => MassProperties::from_cylinder(am.density, half_height, radius),
+                config::Shape::Cuboid { half } => {
+                    MassProperties::from_cuboid(am.density, half.into())
+                }
+                config::Shape::ConvexHull { .. } | config::Shape::TriMesh { .. } => {
+                    unimplemented!()
+                }
+            },
+            None => Default::default(),
+        };
+
+        let pose = transform.into_pose();
+        let rigid_body = rapier3d::dynamics::RigidBodyBuilder::new(dynamic_input.into_rapier())
+            .pose(pose)
+            .additional_mass_properties(add_mass_properties)
+            .build();
+        let rb_handle = self.physics.rigid_bodies.insert(rigid_body);
+
+        let mut colliders = Vec::new();
+        for cc in config.colliders.iter() {
+            let pose = rapier3d::math::Pose::from_parts(cc.pos.into(), make_quaternion(cc.rot));
+            let builder = match cc.shape {
+                config::Shape::Ball { radius } => ColliderBuilder::ball(radius),
+                config::Shape::Cylinder {
+                    half_height,
+                    radius,
+                } => ColliderBuilder::cylinder(half_height, radius),
+                config::Shape::Cuboid { half } => ColliderBuilder::cuboid(half.x, half.y, half.z),
+                config::Shape::ConvexHull {
+                    ref points,
+                    border_radius,
+                } => {
+                    let pv = points
+                        .iter()
+                        .map(|p| glam::Vec3::from(*p))
+                        .collect::<Vec<_>>();
+                    let result = if border_radius != 0.0 {
+                        ColliderBuilder::round_convex_hull(&pv, border_radius)
+                    } else {
+                        ColliderBuilder::convex_hull(&pv)
+                    };
+                    result.expect("Unable to build convex hull shape")
+                }
+                config::Shape::TriMesh {
+                    ref model,
+                    convex,
+                    border_radius,
+                } => {
+                    let trimesh = trimesh::load(&format!("{}/{}", self.data_path, model));
+                    if convex && border_radius != 0.0 {
+                        ColliderBuilder::round_convex_mesh(
+                            trimesh.points,
+                            &trimesh.triangles,
+                            border_radius,
+                        )
+                        .expect("Unable to build rounded convex mesh")
+                    } else if convex {
+                        ColliderBuilder::convex_mesh(trimesh.points, &trimesh.triangles)
+                            .expect("Unable to build convex mesh")
+                    } else {
+                        assert_eq!(border_radius, 0.0);
+                        // Shared triangle edges are not real surface features. Without
+                        // pseudo-normal correction, a rounded dynamic shape can catch on
+                        // those edges even when the rendered mesh looks perfectly smooth.
+                        let flags = static_trimesh_flags();
+                        ColliderBuilder::trimesh_with_flags(
+                            trimesh.points,
+                            trimesh.triangles,
+                            flags,
+                        )
+                        .unwrap()
+                    }
+                }
+            };
+            let collider = builder
+                .density(cc.density)
+                .friction(cc.friction)
+                .restitution(cc.restitution)
+                .position(pose)
+                .build();
+            let c_handle = self.physics.colliders.insert_with_parent(
+                collider,
+                rb_handle,
+                &mut self.physics.rigid_bodies,
+            );
+            colliders.push(c_handle);
+        }
+
+        let raw_handle = self.objects.insert(Object {
+            name: config.name.clone(),
+            rigid_body: rb_handle,
+            colliders,
+            visuals,
+            color_tint: [1.0; 4],
+            animation: None,
+        });
+        Self::insert_render_objects(
+            &self.physics,
+            &self.objects,
+            &mut self.render_objects,
+            raw_handle,
+        );
+        self.renderer.reset_scene_history();
+        self.physics.rigid_bodies[rb_handle].user_data = raw_handle as u128;
+        ObjectHandle(raw_handle)
+    }
+
+    /// Create a procedural model from raw geometry data.
+    ///
+    /// Returns a handle that can be used to spawn objects with this model.
+    /// The model uses shared memory, so no GPU transfer is needed.
+    pub fn create_model(
+        &mut self,
+        name: &str,
+        geometries: Vec<blade_render::ProceduralGeometry>,
+    ) -> blade_asset::Handle<blade_render::Model> {
+        let model = self.asset_hub.models.baker.create_model(name, geometries);
+        self.asset_hub.models.insert(model)
+    }
+
+    /// Add a visual object from a pre-existing model handle and physics config.
+    pub fn add_object_with_model(
+        &mut self,
+        name: &str,
+        model: blade_asset::Handle<blade_render::Model>,
+        transform: Transform,
+        dynamic_input: DynamicInput,
+    ) -> ObjectHandle {
+        let visual = Visual {
+            model,
+            animation_model: None,
+            similarity: glam::Affine3A::IDENTITY,
+        };
+
+        let pose = transform.into_pose();
+        let rigid_body = rapier3d::dynamics::RigidBodyBuilder::new(dynamic_input.into_rapier())
+            .pose(pose)
+            .build();
+        let rb_handle = self.physics.rigid_bodies.insert(rigid_body);
+
+        let raw_handle = self.objects.insert(Object {
+            name: name.to_string(),
+            rigid_body: rb_handle,
+            colliders: Vec::new(),
+            visuals: vec![visual],
+            color_tint: [1.0; 4],
+            animation: None,
+        });
+        Self::insert_render_objects(
+            &self.physics,
+            &self.objects,
+            &mut self.render_objects,
+            raw_handle,
+        );
+        self.renderer.reset_scene_history();
+        // Store ObjectHandle index in rigid body user_data for fast lookup in contacts
+        self.physics.rigid_bodies[rb_handle].user_data = raw_handle as u128;
+        ObjectHandle(raw_handle)
+    }
+
+    /// Attach a sphere collider to an object for physics interactions.
+    pub fn add_ball_collider(&mut self, handle: ObjectHandle, radius: f32, restitution: f32) {
+        let object = &self.objects[handle.0];
+        let collider = rapier3d::geometry::ColliderBuilder::ball(radius)
+            .restitution(restitution)
+            .density(1.0)
+            .build();
+        let col_handle = self.physics.colliders.insert_with_parent(
+            collider,
+            object.rigid_body,
+            &mut self.physics.rigid_bodies,
+        );
+        self.objects[handle.0].colliders.push(col_handle);
+    }
+
+    /// Attach a convex hull collider from a set of points.
+    pub fn add_convex_hull_collider(
+        &mut self,
+        handle: ObjectHandle,
+        points: &[[f32; 3]],
+        restitution: f32,
+    ) {
+        let hull_points: Vec<_> = points.iter().map(|p| glam::Vec3::from(*p)).collect();
+        let collider = rapier3d::geometry::ColliderBuilder::convex_hull(&hull_points)
+            .unwrap_or_else(|| rapier3d::geometry::ColliderBuilder::ball(1.0))
+            .restitution(restitution)
+            .density(1.0)
+            .build();
+        let object = &self.objects[handle.0];
+        let col_handle = self.physics.colliders.insert_with_parent(
+            collider,
+            object.rigid_body,
+            &mut self.physics.rigid_bodies,
+        );
+        self.objects[handle.0].colliders.push(col_handle);
+    }
+
+    /// Set the linear and angular velocity of an object.
+    pub fn set_velocity(
+        &mut self,
+        handle: ObjectHandle,
+        linear: mint::Vector3<f32>,
+        angular: mint::Vector3<f32>,
+    ) {
+        let object = &self.objects[handle.0];
+        let body = self
+            .physics
+            .rigid_bodies
+            .get_mut(object.rigid_body)
+            .unwrap();
+        body.set_linvel(linear.into(), true);
+        body.set_angvel(angular.into(), true);
+    }
+
+    /// Get the linear and angular velocity of an object.
+    pub fn get_velocity(&self, handle: ObjectHandle) -> (mint::Vector3<f32>, mint::Vector3<f32>) {
+        let object = &self.objects[handle.0];
+        let body = &self.physics.rigid_bodies[object.rigid_body];
+        (body.linvel().into(), body.angvel().into())
+    }
+
+    /// Get the position of an object.
+    pub fn get_object_position(&self, handle: ObjectHandle) -> mint::Vector3<f32> {
+        let object = &self.objects[handle.0];
+        let body = &self.physics.rigid_bodies[object.rigid_body];
+        body.position().translation.into()
+    }
+
+    /// Remove an object and its physics state.
+    pub fn remove_object(&mut self, handle: ObjectHandle) {
+        let Some(render_range) = self
+            .objects
+            .get(handle.0)
+            .map(|_| Self::render_object_range(&self.objects, handle.0))
+        else {
+            return;
+        };
+        let object = self.objects.remove(handle.0);
+        self.retired_render_objects
+            .extend(self.render_objects.drain(render_range));
+        self.renderer.reset_scene_history();
+        for &collider in object.colliders.iter() {
+            self.physics.colliders.remove(
+                collider,
+                &mut self.physics.island_manager,
+                &mut self.physics.rigid_bodies,
+                &mut self.physics.soft_bodies,
+                false,
+            );
+        }
+        self.physics.rigid_bodies.remove(
+            object.rigid_body,
+            &mut self.physics.island_manager,
+            &mut self.physics.colliders,
+            &mut self.physics.impulse_joints,
+            &mut self.physics.multibody_joints,
+            &mut self.physics.soft_bodies,
+            true,
+        );
+    }
+
+    pub fn wake_up(&mut self, object: ObjectHandle) {
+        let rb_handle = self.objects[object.0].rigid_body;
+        let rb = self.physics.rigid_bodies.get_mut(rb_handle).unwrap();
+        rb.wake_up(true);
+    }
+
+    pub fn add_joint(
+        &mut self,
+        parent: ObjectHandle,
+        child: ObjectHandle,
+        desc: JointDesc,
+    ) -> JointHandle {
+        let data = {
+            let mut locked_axes = rapier3d::dynamics::JointAxesMask::empty();
+            let freedoms = [
+                (JointAxis::LinearX, &desc.linear.x),
+                (JointAxis::LinearY, &desc.linear.y),
+                (JointAxis::LinearZ, &desc.linear.z),
+                (JointAxis::AngularX, &desc.angular.x),
+                (JointAxis::AngularY, &desc.angular.y),
+                (JointAxis::AngularZ, &desc.angular.z),
+            ];
+            let mut joint_builder =
+                rapier3d::dynamics::GenericJointBuilder::new(Default::default())
+                    .local_frame1(desc.parent_anchor.into_pose())
+                    .local_frame2(desc.child_anchor.into_pose())
+                    .contacts_enabled(desc.allow_contacts);
+            for &(axis, maybe_freedom) in freedoms.iter() {
+                let rapier_axis = axis.into_rapier();
+                match *maybe_freedom {
+                    Some(ref freedom) => {
+                        if let Some(limits) = freedom.limits.as_ref() {
+                            joint_builder =
+                                joint_builder.limits(rapier_axis, [limits.start, limits.end]);
+                        }
+                        if let Some(motor) = freedom.motor.as_ref() {
+                            joint_builder = joint_builder
+                                .motor_position(rapier_axis, 0.0, motor.stiffness, motor.damping)
+                                .motor_max_force(rapier_axis, motor.max_force);
+                        }
+                    }
+                    None => {
+                        locked_axes |= rapier3d::dynamics::JointAxesMask::from(rapier_axis);
+                    }
+                }
+            }
+            joint_builder.locked_axes(locked_axes).0
+        };
+
+        let body1 = self.objects[parent.0].rigid_body;
+        let body2 = self.objects[child.0].rigid_body;
+        if desc.is_hard {
+            JointHandle(JointHandleInner::Hard(
+                self.physics
+                    .multibody_joints
+                    .insert(body1, body2, data, true)
+                    .unwrap(),
+            ))
+        } else {
+            JointHandle(JointHandleInner::Soft(
+                self.physics.impulse_joints.insert(body1, body2, data, true),
+            ))
+        }
+    }
+
+    /// Get the current object transform.
+    ///
+    /// Since the simulation is done at fixed key frames, the position specifically
+    /// at the current time needs to be predicted.
+    pub fn get_object_transform(&self, handle: ObjectHandle, prediction: Prediction) -> Transform {
+        let object = &self.objects[handle.0];
+        let body = &self.physics.rigid_bodies[object.rigid_body];
+        let pose = match prediction {
+            Prediction::LastKnown => *body.position(),
+            Prediction::IntegrateVelocity => unimplemented!(),
+            Prediction::IntegrateVelocityAndForces => {
+                body.predict_position_using_velocity_and_forces(self.time_ahead)
+            }
+        };
+        Transform::from_pose(pose)
+    }
+
+    pub fn get_object_bounds(&self, handle: ObjectHandle) -> BoundingBox {
+        let object = &self.objects[handle.0];
+        let mut aabb = rapier3d::geometry::Aabb::new_invalid();
+        for &collider_handle in object.colliders.iter() {
+            let collider = &self.physics.colliders[collider_handle];
+            rapier3d::geometry::BoundingVolume::merge(&mut aabb, &collider.compute_aabb());
+        }
+        BoundingBox {
+            center: aabb.center().into(),
+            half: aabb.half_extents().into(),
+        }
+    }
+
+    pub fn apply_linear_impulse(&mut self, handle: ObjectHandle, impulse: mint::Vector3<f32>) {
+        let object = &self.objects[handle.0];
+        let body = &mut self.physics.rigid_bodies[object.rigid_body];
+        body.apply_impulse(impulse.into(), false)
+    }
+
+    pub fn apply_angular_impulse(&mut self, handle: ObjectHandle, impulse: mint::Vector3<f32>) {
+        let object = &self.objects[handle.0];
+        let body = &mut self.physics.rigid_bodies[object.rigid_body];
+        body.apply_torque_impulse(impulse.into(), false)
+    }
+
+    pub fn teleport_object(&mut self, handle: ObjectHandle, transform: Transform) {
+        let object = &self.objects[handle.0];
+        let body = &mut self.physics.rigid_bodies[object.rigid_body];
+        body.set_linvel(Default::default(), false);
+        body.set_angvel(Default::default(), false);
+        body.set_position(transform.into_pose(), true);
+    }
+
+    /// Enable swept collision detection for a fast-moving physics object.
+    ///
+    /// This is useful for vehicles and projectiles that may cross a thin collider or
+    /// several terrain triangles during one fixed simulation step.
+    pub fn set_ccd_enabled(&mut self, handle: ObjectHandle, enabled: bool) {
+        let object = &self.objects[handle.0];
+        let body = self
+            .physics
+            .rigid_bodies
+            .get_mut(object.rigid_body)
+            .expect("object rigid body");
+        body.enable_ccd(enabled);
+        body.wake_up(true);
+    }
+
+    /// Set a per-object color tint that multiplies the model's material colors.
+    /// Default is [1, 1, 1, 1] (no tint).
+    pub fn set_color_tint(&mut self, handle: ObjectHandle, tint: [f32; 4]) {
+        self.objects[handle.0].color_tint = tint;
+    }
+
+    /// Start, replace, or stop skeletal animation playback for an object.
+    ///
+    /// The clip index selects from the first animated visual. Other visuals use
+    /// the same named clip, or the same index when it is unnamed.
+    ///
+    /// Animation data for the object's models is loaded on demand, so calling
+    /// this for the first time may delay rendering until the load completes.
+    /// Models without a source file (e.g. procedural ones) can't be animated.
+    /// Load animation clips for an object's visuals once their models have cooked.
+    /// Safe to call every frame; no-ops when already bound or still cooking.
+    pub fn ensure_animation_models(&mut self, handle: ObjectHandle) {
+        for visual in self.objects[handle.0].visuals.iter_mut() {
+            if visual.animation_model.is_some() {
+                continue;
+            }
+            let Some(path) = self.asset_hub.models.get_full_source_path(visual.model) else {
+                continue;
+            };
+            let (animation_model, task) = self.animation_models.load(&path, animation::Meta);
+            visual.animation_model = Some(animation_model);
+            self.load_tasks.push(task.clone());
+        }
+    }
+
+    pub fn set_animation(&mut self, handle: ObjectHandle, animation: Option<AnimationPlayer>) {
+        if animation.is_some() {
+            self.ensure_animation_models(handle);
+        }
+        self.objects[handle.0].animation = animation;
+    }
+
+    pub fn set_joint_motor(
+        &mut self,
+        handle: JointHandle,
+        axis: JointAxis,
+        target_pos: f32,
+        target_vel: f32,
+    ) {
+        let joint = &mut self.physics[handle];
+        let rapier_axis = axis.into_rapier();
+        match joint.motor(rapier_axis) {
+            Some(&rapier3d::dynamics::JointMotor {
+                damping, stiffness, ..
+            }) => {
+                joint.set_motor(rapier_axis, target_pos, target_vel, stiffness, damping);
+            }
+            None => panic!("Axis {:?} of {:?} is not motorized", axis, handle),
+        }
+    }
+
+    pub fn set_environment_map(&mut self, path: &str) {
+        if path.is_empty() {
+            self.environment_map = None;
+        } else {
+            let full = format!("{}/{}", self.data_path, path);
+            let (handle, task) = self.asset_hub.textures.load(
+                full,
+                blade_render::texture::Meta {
+                    format: gpu::TextureFormat::Rgba32Float,
+                    generate_mips: false,
+                    y_flip: false,
+                },
+            );
+            self.environment_map = Some(handle);
+            self.load_tasks.push(task.clone());
+        }
+    }
+
+    /// Create an environment map from raw RGBA u8 pixel data and set it as active.
+    pub fn create_environment_map(
+        &mut self,
+        name: &str,
+        width: u32,
+        height: u32,
+        data: &[[u8; 4]],
+    ) {
+        let texture = self
+            .asset_hub
+            .textures
+            .baker
+            .create_texture(name, width, height, data);
+        let handle = self.asset_hub.textures.insert(texture);
+        self.environment_map = Some(handle);
+    }
+
+    pub fn set_gravity(&mut self, force: f32) {
+        self.physics.gravity.y = -force;
+    }
+
+    pub fn set_frozen(&mut self, frozen: bool) {
+        if let Renderer::RayTracer {
+            ref mut frame_config,
+            ..
+        } = self.renderer
+        {
+            frame_config.frozen = frozen;
+        }
+    }
+
+    pub fn set_debug_draw(&mut self, enabled: bool) {
+        if let Renderer::RayTracer {
+            ref mut frame_config,
+            ..
+        } = self.renderer
+        {
+            frame_config.debug_draw = enabled;
+        }
+    }
+
+    pub fn set_average_luminosity(&mut self, avg_lum: f32) {
+        if let Renderer::RayTracer {
+            ref mut post_proc_config,
+            ..
+        } = self.renderer
+        {
+            post_proc_config.average_luminocity = avg_lum;
+        }
+    }
+
+    pub fn set_debug_pixel(&mut self, mouse_pos: Option<[i32; 2]>) {
+        self.debug.mouse_pos = mouse_pos;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn static_triangle_meshes_fix_internal_contact_edges() {
+        assert!(
+            super::static_trimesh_flags()
+                .contains(rapier3d::geometry::TriMeshFlags::FIX_INTERNAL_EDGES)
+        );
+    }
+}

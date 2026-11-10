@@ -1,0 +1,1101 @@
+use ash::vk;
+use gpu_alloc_ash::AshMemoryDevice;
+#[cfg(not(target_os = "windows"))]
+use std::os::fd::{AsRawFd, BorrowedFd, IntoRawFd};
+use std::{mem, ptr};
+
+impl From<crate::Transform> for crate::AccelerationStructureTransform {
+    fn from(transform: crate::Transform) -> Self {
+        let rows: [[f32; 4]; 3] = transform.into();
+        Self(bytemuck::cast(rows))
+    }
+}
+
+fn memory_allocate_flags(needs_device_address: bool) -> vk::MemoryAllocateFlags {
+    if needs_device_address {
+        vk::MemoryAllocateFlags::DEVICE_ADDRESS
+    } else {
+        vk::MemoryAllocateFlags::empty()
+    }
+}
+
+fn memory_usage_flags(memory: crate::Memory, needs_device_address: bool) -> gpu_alloc::UsageFlags {
+    let device_address = if needs_device_address {
+        gpu_alloc::UsageFlags::DEVICE_ADDRESS
+    } else {
+        gpu_alloc::UsageFlags::empty()
+    };
+    match memory {
+        crate::Memory::Device | crate::Memory::External(_) => {
+            gpu_alloc::UsageFlags::FAST_DEVICE_ACCESS | device_address
+        }
+        crate::Memory::DeviceTransient => {
+            gpu_alloc::UsageFlags::FAST_DEVICE_ACCESS
+                | gpu_alloc::UsageFlags::TRANSIENT
+                | device_address
+        }
+        crate::Memory::Shared => {
+            gpu_alloc::UsageFlags::HOST_ACCESS
+                | gpu_alloc::UsageFlags::DOWNLOAD
+                | gpu_alloc::UsageFlags::UPLOAD
+                | gpu_alloc::UsageFlags::FAST_DEVICE_ACCESS
+                | device_address
+        }
+        crate::Memory::Download => {
+            gpu_alloc::UsageFlags::HOST_ACCESS | gpu_alloc::UsageFlags::DOWNLOAD | device_address
+        }
+        crate::Memory::Upload => {
+            gpu_alloc::UsageFlags::HOST_ACCESS | gpu_alloc::UsageFlags::UPLOAD | device_address
+        }
+    }
+}
+
+struct Allocation {
+    memory: vk::DeviceMemory,
+    offset: u64,
+    data: *mut u8,
+    handle: usize,
+    memory_type: crate::Memory,
+}
+
+impl super::Context {
+    fn allocate_memory(
+        &self,
+        requirements: vk::MemoryRequirements,
+        memory: crate::Memory,
+        name: &str,
+        needs_device_address: bool,
+    ) -> Allocation {
+        let mut manager = self.memory.lock().unwrap();
+        let alloc_usage = memory_usage_flags(memory, needs_device_address);
+        let memory_types = requirements.memory_type_bits & manager.valid_ash_memory_types;
+        let mut block = match memory {
+            crate::Memory::External(e) => {
+                let memory_properties = unsafe {
+                    self.inner
+                        .instance
+                        .core
+                        .get_physical_device_memory_properties(self.physical_device)
+                };
+                let handle_type = external_source_handle_type(e);
+
+                // For a `HostAllocation` import the driver constrains
+                // which memory types can back the pointer — query it
+                // via `vkGetMemoryHostPointerPropertiesEXT` and
+                // intersect with the buffer's requirements.
+                let host_pointer_memory_type_bits = match e {
+                    crate::ExternalMemorySource::HostAllocation(ptr) => {
+                        let ext = self.device.external_memory_host.as_ref().expect(
+                            "Memory::External(HostAllocation) requires \
+                             VK_EXT_external_memory_host — check \
+                             Capabilities::external_memory_host before calling",
+                        );
+                        let mut host_props = vk::MemoryHostPointerPropertiesEXT::default();
+                        unsafe {
+                            (ext.fp().get_memory_host_pointer_properties_ext)(
+                                self.device.core.handle(),
+                                handle_type,
+                                ptr as *const std::ffi::c_void,
+                                &mut host_props,
+                            )
+                            .result()
+                            .expect("vkGetMemoryHostPointerPropertiesEXT");
+                        }
+                        Some(host_props.memory_type_bits)
+                    }
+                    _ => None,
+                };
+
+                let allowed = memory_types & host_pointer_memory_type_bits.unwrap_or(!0);
+                let (memory_type_index, memory_type) = if host_pointer_memory_type_bits.is_some() {
+                    // Host-pointer imports need HOST_VISIBLE. Prefer
+                    // HOST_COHERENT to skip explicit flushes.
+                    (0..memory_properties.memory_type_count)
+                        .filter(|&i| allowed & (1 << i) != 0)
+                        .map(|i| (i, memory_properties.memory_types[i as usize]))
+                        .filter(|item| {
+                            item.1
+                                .property_flags
+                                .contains(vk::MemoryPropertyFlags::HOST_VISIBLE)
+                        })
+                        .min_by_key(|item| {
+                            if item
+                                .1
+                                .property_flags
+                                .contains(vk::MemoryPropertyFlags::HOST_COHERENT)
+                            {
+                                0u8
+                            } else {
+                                1u8
+                            }
+                        })
+                        .expect(
+                            "no host-visible memory type compatible with the imported \
+                                 host pointer",
+                        )
+                } else {
+                    assert!(
+                        allowed != 0,
+                        "no memory type satisfies the external-buffer requirements"
+                    );
+                    let idx = allowed.ilog2();
+                    (idx, memory_properties.memory_types[idx as usize])
+                };
+
+                // `VkPhysicalDeviceExternalMemoryHostPropertiesEXT::minImportedHostPointerAlignment`
+                // — allocationSize must be a multiple of this when
+                // importing a host pointer.
+                let allocation_size = if host_pointer_memory_type_bits.is_some() {
+                    let align = self.device.min_imported_host_pointer_alignment.max(1);
+                    requirements.size.next_multiple_of(align)
+                } else {
+                    requirements.size
+                };
+
+                #[cfg(not(target_os = "windows"))]
+                let mut imported_fd = None;
+                #[cfg(not(target_os = "windows"))]
+                let mut import_fd = |fd| {
+                    let fd = unsafe { BorrowedFd::borrow_raw(fd) }
+                        .try_clone_to_owned()
+                        .expect("duplicate external memory FD");
+                    let info = vk::ImportMemoryFdInfoKHR::default()
+                        .handle_type(handle_type)
+                        .fd(fd.as_raw_fd());
+                    imported_fd = Some(fd);
+                    info
+                };
+
+                let external_info: &mut dyn vk::ExtendsMemoryAllocateInfo = match e {
+                    #[cfg(target_os = "windows")]
+                    crate::ExternalMemorySource::Win32(Some(handle))
+                    | crate::ExternalMemorySource::Win32KMT(Some(handle)) => {
+                        &mut vk::ImportMemoryWin32HandleInfoKHR {
+                            handle_type,
+                            handle,
+                            ..Default::default()
+                        }
+                    }
+                    #[cfg(not(target_os = "windows"))]
+                    crate::ExternalMemorySource::Fd(Some(fd)) => &mut import_fd(fd),
+                    #[cfg(target_os = "linux")]
+                    crate::ExternalMemorySource::Dma(Some(fd)) => &mut import_fd(fd),
+                    crate::ExternalMemorySource::HostAllocation(ptr) => {
+                        &mut vk::ImportMemoryHostPointerInfoEXT {
+                            handle_type,
+                            p_host_pointer: ptr as *mut std::ffi::c_void,
+                            ..Default::default()
+                        }
+                    }
+                    // All sources that are exporting don't need a specific struct
+                    _ => &mut vk::ExportMemoryAllocateInfo {
+                        handle_types: handle_type,
+                        ..Default::default()
+                    },
+                };
+
+                let mut allocation_info = vk::MemoryAllocateInfo {
+                    allocation_size,
+                    memory_type_index,
+                    ..vk::MemoryAllocateInfo::default()
+                }
+                .push_next(external_info);
+                let flags = memory_allocate_flags(needs_device_address);
+                let mut flags_info = vk::MemoryAllocateFlagsInfo::default().flags(flags);
+                if !flags.is_empty() {
+                    allocation_info = allocation_info.push_next(&mut flags_info);
+                }
+
+                let memory = unsafe {
+                    self.device
+                        .core
+                        .allocate_memory(&allocation_info, None)
+                        .unwrap()
+                };
+                #[cfg(not(target_os = "windows"))]
+                if let Some(fd) = imported_fd {
+                    let _ = fd.into_raw_fd(); // Vulkan owns the duplicate on success.
+                }
+
+                unsafe {
+                    manager.allocator.import_memory(
+                        memory,
+                        memory_type_index,
+                        gpu_alloc_ash::memory_properties_from_ash(memory_type.property_flags),
+                        0,
+                        allocation_size,
+                    )
+                }
+            }
+            _ => unsafe {
+                manager
+                    .allocator
+                    .alloc(
+                        AshMemoryDevice::wrap(&self.device.core),
+                        gpu_alloc::Request {
+                            size: requirements.size,
+                            align_mask: requirements.alignment - 1,
+                            usage: alloc_usage,
+                            memory_types,
+                        },
+                    )
+                    .unwrap()
+            },
+        };
+
+        let data = match memory {
+            crate::Memory::External(crate::ExternalMemorySource::HostAllocation(ptr)) => {
+                ptr as *mut u8
+            }
+            crate::Memory::Device | crate::Memory::DeviceTransient | crate::Memory::External(_) => {
+                ptr::null_mut()
+            }
+            crate::Memory::Shared | crate::Memory::Download | crate::Memory::Upload => unsafe {
+                block
+                    .map(
+                        AshMemoryDevice::wrap(&self.device.core),
+                        0,
+                        requirements.size as usize,
+                    )
+                    .unwrap()
+                    .as_ptr()
+            },
+        };
+        Allocation {
+            memory: *block.memory(),
+            offset: block.offset(),
+            data,
+            handle: manager.slab.insert((block, name.to_string())),
+            memory_type: memory,
+        }
+    }
+
+    fn free_memory(&self, handle: usize) {
+        let mut manager = self.memory.lock().unwrap();
+        let (block, _name) = manager.slab.remove(handle);
+        unsafe {
+            manager
+                .allocator
+                .dealloc(AshMemoryDevice::wrap(&self.device.core), block);
+        }
+    }
+
+    //TODO: move these into `ResourceDevice` trait when ready
+    pub fn get_bottom_level_acceleration_structure_sizes(
+        &self,
+        meshes: &[crate::AccelerationStructureMesh],
+    ) -> crate::AccelerationStructureSizes {
+        let mut sizes = crate::AccelerationStructureSizes::default();
+        for updatable in [false, true] {
+            let blas_input = self
+                .device
+                .map_acceleration_structure_meshes(meshes, updatable);
+            let rt = self.device.ray_tracing.as_ref().unwrap();
+            let mut sizes_raw = vk::AccelerationStructureBuildSizesInfoKHR::default();
+            unsafe {
+                rt.acceleration_structure
+                    .get_acceleration_structure_build_sizes(
+                        vk::AccelerationStructureBuildTypeKHR::DEVICE,
+                        &blas_input.build_info,
+                        &blas_input.max_primitive_counts,
+                        &mut sizes_raw,
+                    )
+            };
+            sizes.data = sizes.data.max(sizes_raw.acceleration_structure_size);
+            sizes.scratch = sizes.scratch.max(
+                sizes_raw
+                    .build_scratch_size
+                    .max(sizes_raw.update_scratch_size),
+            );
+        }
+        sizes
+    }
+
+    pub fn get_top_level_acceleration_structure_sizes(
+        &self,
+        instance_count: u32,
+    ) -> crate::AccelerationStructureSizes {
+        let geometry = vk::AccelerationStructureGeometryKHR::default()
+            .geometry_type(vk::GeometryTypeKHR::INSTANCES)
+            .geometry(vk::AccelerationStructureGeometryDataKHR {
+                instances: vk::AccelerationStructureGeometryInstancesDataKHR::default(),
+            });
+        let geometries = [geometry];
+        let build_info = vk::AccelerationStructureBuildGeometryInfoKHR::default()
+            .ty(vk::AccelerationStructureTypeKHR::TOP_LEVEL)
+            .mode(vk::BuildAccelerationStructureModeKHR::BUILD)
+            .geometries(&geometries);
+
+        let rt = self.device.ray_tracing.as_ref().unwrap();
+        let mut sizes_raw = vk::AccelerationStructureBuildSizesInfoKHR::default();
+        unsafe {
+            rt.acceleration_structure
+                .get_acceleration_structure_build_sizes(
+                    vk::AccelerationStructureBuildTypeKHR::DEVICE,
+                    &build_info,
+                    &[instance_count],
+                    &mut sizes_raw,
+                )
+        };
+        crate::AccelerationStructureSizes {
+            data: sizes_raw.acceleration_structure_size,
+            scratch: sizes_raw.build_scratch_size,
+        }
+    }
+
+    pub fn create_acceleration_structure_instance_buffer(
+        &self,
+        instances: &[crate::AccelerationStructureInstance],
+        bottom_level: &[super::AccelerationStructure],
+    ) -> super::Buffer {
+        let buffer = self.create_buffer(crate::BufferDesc {
+            name: "instance buffer",
+            size: (instances.len().max(1) * mem::size_of::<vk::AccelerationStructureInstanceKHR>())
+                as u64,
+            memory: crate::Memory::Shared,
+        });
+        let rt = self.device.ray_tracing.as_ref().unwrap();
+        for (i, instance) in instances.iter().enumerate() {
+            let device_address_info = vk::AccelerationStructureDeviceAddressInfoKHR {
+                acceleration_structure: bottom_level
+                    [instance.acceleration_structure_index as usize]
+                    .raw,
+                ..Default::default()
+            };
+            let vk_instance = vk::AccelerationStructureInstanceKHR {
+                transform: unsafe {
+                    mem::transmute::<mint::RowMatrix3x4<f32>, vk::TransformMatrixKHR>(
+                        instance.transform,
+                    )
+                },
+                instance_custom_index_and_mask: vk::Packed24_8::new(
+                    instance.custom_index,
+                    instance.mask as u8,
+                ),
+                instance_shader_binding_table_record_offset_and_flags: vk::Packed24_8::new(0, 0),
+                acceleration_structure_reference: vk::AccelerationStructureReferenceKHR {
+                    device_handle: unsafe {
+                        rt.acceleration_structure
+                            .get_acceleration_structure_device_address(&device_address_info)
+                    },
+                },
+            };
+            unsafe {
+                ptr::write(
+                    (buffer.data() as *mut vk::AccelerationStructureInstanceKHR).add(i),
+                    vk_instance,
+                );
+            }
+        }
+        buffer
+    }
+
+    pub fn get_external_texture_source(
+        &self,
+        texture: super::Texture,
+    ) -> Option<crate::ExternalMemorySource> {
+        texture.external
+    }
+
+    pub fn get_external_buffer_source(
+        &self,
+        buffer: super::Buffer,
+    ) -> Option<crate::ExternalMemorySource> {
+        buffer.external
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn check_external_buffer(
+        &self,
+        source: crate::ExternalMemorySource,
+        usage: vk::BufferUsageFlags,
+    ) {
+        let importing = match source {
+            crate::ExternalMemorySource::Fd(value) => value.is_some(),
+            _ => return,
+        };
+        assert!(
+            self.device.external_memory.is_some(),
+            "external memory is unavailable"
+        );
+        let mut properties = vk::ExternalBufferProperties::default();
+        unsafe {
+            self.inner
+                .instance
+                .core
+                .get_physical_device_external_buffer_properties(
+                    self.physical_device,
+                    &vk::PhysicalDeviceExternalBufferInfo::default()
+                        .usage(usage)
+                        .handle_type(external_source_handle_type(source)),
+                    &mut properties,
+                );
+        }
+        let features = properties
+            .external_memory_properties
+            .external_memory_features;
+        let required = if importing {
+            vk::ExternalMemoryFeatureFlags::IMPORTABLE
+        } else {
+            vk::ExternalMemoryFeatureFlags::EXPORTABLE
+        };
+        assert!(
+            features.contains(required)
+                && !features.contains(vk::ExternalMemoryFeatureFlags::DEDICATED_ONLY),
+            "non-dedicated external buffers are unavailable"
+        );
+    }
+}
+
+#[hidden_trait::expose]
+impl crate::traits::ResourceDevice for super::Context {
+    type Buffer = super::Buffer;
+    type Texture = super::Texture;
+    type TextureView = super::TextureView;
+    type Sampler = super::Sampler;
+    type AccelerationStructure = super::AccelerationStructure;
+
+    fn create_buffer(&self, desc: crate::BufferDesc) -> super::Buffer {
+        use vk::BufferUsageFlags as Buf;
+        let external_source = match desc.memory {
+            crate::Memory::External(e) => Some(e),
+            _ => None,
+        };
+        let needs_device_address = self.device.buffer_device_address
+            && match external_source {
+                #[cfg(not(target_os = "windows"))]
+                Some(crate::ExternalMemorySource::Fd(_)) => false,
+                _ => true,
+            };
+        let mut external_next = external_source.map(|e| vk::ExternalMemoryBufferCreateInfo {
+            handle_types: external_source_handle_type(e),
+            ..Default::default()
+        });
+        let mut vk_info = vk::BufferCreateInfo {
+            size: desc.size,
+            usage: Buf::TRANSFER_SRC
+                | Buf::TRANSFER_DST
+                | Buf::STORAGE_BUFFER
+                | Buf::INDEX_BUFFER
+                | Buf::VERTEX_BUFFER
+                | Buf::INDIRECT_BUFFER,
+            sharing_mode: vk::SharingMode::EXCLUSIVE,
+            ..Default::default()
+        };
+        // Always include UNIFORM_BUFFER usage: even when inline uniform blocks
+        // are supported, bindings that exceed the device limit fall back to UBOs.
+        vk_info.usage |= Buf::UNIFORM_BUFFER;
+        if let Some(external_next) = external_next.as_mut() {
+            vk_info = vk_info.push_next(external_next);
+        }
+        if needs_device_address {
+            vk_info.usage |= Buf::SHADER_DEVICE_ADDRESS;
+        }
+        if needs_device_address && self.device.ray_tracing.is_some() {
+            vk_info.usage |= Buf::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR;
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        if let Some(source) = external_source {
+            self.check_external_buffer(source, vk_info.usage);
+        }
+        let raw = unsafe { self.device.core.create_buffer(&vk_info, None).unwrap() };
+        let mut requirements = unsafe { self.device.core.get_buffer_memory_requirements(raw) };
+        requirements.alignment = requirements.alignment.max(self.min_buffer_alignment);
+        let allocation =
+            self.allocate_memory(requirements, desc.memory, desc.name, needs_device_address);
+
+        log::info!(
+            "Creating buffer {:?} of size {}, name '{}', handle {:?}",
+            raw,
+            desc.size,
+            desc.name,
+            allocation.handle
+        );
+        if let Err(error) = unsafe {
+            self.device
+                .core
+                .bind_buffer_memory(raw, allocation.memory, allocation.offset)
+        } {
+            unsafe {
+                self.device.core.destroy_buffer(raw, None);
+            }
+            self.free_memory(allocation.handle);
+            panic!("buffer memory binding failed: {error}");
+        }
+        if !desc.name.is_empty() {
+            self.set_object_name(raw, desc.name);
+        }
+
+        super::Buffer {
+            raw,
+            memory_handle: allocation.handle,
+            mapped_data: allocation.data,
+            size: desc.size,
+            external: fetch_external_source(&self.device, allocation),
+        }
+    }
+
+    fn sync_buffer(&self, _piece: crate::BufferPiece, _size: u64, _target: crate::BufferTarget) {}
+
+    fn destroy_buffer(&self, buffer: super::Buffer) {
+        log::info!(
+            "Destroying buffer {:?}, handle {:?}",
+            buffer.raw,
+            buffer.memory_handle
+        );
+        unsafe { self.device.core.destroy_buffer(buffer.raw, None) };
+        self.free_memory(buffer.memory_handle);
+    }
+
+    fn create_texture(&self, desc: crate::TextureDesc) -> super::Texture {
+        let mut create_flags = vk::ImageCreateFlags::empty();
+        if desc.dimension == crate::TextureDimension::D2
+            && desc.size.depth.is_multiple_of(6)
+            && desc.sample_count == 1
+            && desc.size.width == desc.size.height
+        {
+            create_flags |= vk::ImageCreateFlags::CUBE_COMPATIBLE;
+        }
+        // Enable mutable format for multi-aspect textures (e.g. depth+stencil)
+        // so that views can select individual aspects with compatible formats.
+        if desc.format.aspects().contains(crate::TexelAspects::DEPTH)
+            && desc.format.aspects().contains(crate::TexelAspects::STENCIL)
+        {
+            create_flags |= vk::ImageCreateFlags::MUTABLE_FORMAT;
+        }
+
+        let mut external_next = desc.external.map(|e| vk::ExternalMemoryImageCreateInfo {
+            handle_types: external_source_handle_type(e),
+            ..Default::default()
+        });
+
+        let mut vk_info = vk::ImageCreateInfo {
+            flags: create_flags,
+            image_type: map_texture_dimension(desc.dimension),
+            format: super::map_texture_format(desc.format),
+            extent: super::map_extent_3d(&desc.size),
+            mip_levels: desc.mip_level_count,
+            array_layers: desc.array_layer_count,
+            samples: vk::SampleCountFlags::from_raw(desc.sample_count),
+            tiling: vk::ImageTiling::OPTIMAL,
+            usage: map_texture_usage(desc.usage, desc.format.aspects()),
+            sharing_mode: vk::SharingMode::EXCLUSIVE,
+            ..Default::default()
+        };
+
+        if let Some(external_next) = external_next.as_mut() {
+            vk_info = vk_info.push_next(external_next);
+        }
+
+        /*
+            TODO(ErikWDev): Support lazily allocated texture with transient allocation for efficient msaa?
+                            Measure bandwidth usage!
+        */
+        let raw = unsafe { self.device.core.create_image(&vk_info, None).unwrap() };
+        let requirements = unsafe { self.device.core.get_image_memory_requirements(raw) };
+        let allocation = self.allocate_memory(
+            requirements,
+            desc.external
+                .map_or(crate::Memory::Device, crate::Memory::External),
+            desc.name,
+            false,
+        );
+
+        log::info!(
+            "Creating texture {:?} of size {} and format {:?}, name '{}', handle {:?}",
+            raw,
+            desc.size,
+            desc.format,
+            desc.name,
+            allocation.handle
+        );
+        unsafe {
+            self.device
+                .core
+                .bind_image_memory(raw, allocation.memory, allocation.offset)
+                .unwrap()
+        };
+        if !desc.name.is_empty() {
+            self.set_object_name(raw, desc.name);
+        }
+
+        super::Texture {
+            raw,
+            memory_handle: allocation.handle,
+            target_size: [desc.size.width as u16, desc.size.height as u16],
+            format: desc.format,
+            external: fetch_external_source(&self.device, allocation),
+        }
+    }
+
+    fn destroy_texture(&self, texture: super::Texture) {
+        log::info!(
+            "Destroying texture {:?}, handle {:?}",
+            texture.raw,
+            texture.memory_handle
+        );
+        unsafe { self.device.core.destroy_image(texture.raw, None) };
+        self.free_memory(texture.memory_handle);
+    }
+
+    fn create_texture_view(
+        &self,
+        texture: super::Texture,
+        desc: crate::TextureViewDesc,
+    ) -> super::TextureView {
+        let aspects = desc.format.aspects();
+        let subresource_range = super::map_subresource_range(desc.subresources, aspects);
+        let vk_info = vk::ImageViewCreateInfo {
+            image: texture.raw,
+            view_type: map_view_dimension(desc.dimension),
+            format: super::map_texture_format(desc.format),
+            subresource_range,
+            ..Default::default()
+        };
+
+        let raw = unsafe { self.device.core.create_image_view(&vk_info, None).unwrap() };
+        if !desc.name.is_empty() {
+            self.set_object_name(raw, desc.name);
+        }
+
+        super::TextureView {
+            raw,
+            target_size: [
+                (texture.target_size[0] >> desc.subresources.base_mip_level).max(1),
+                (texture.target_size[1] >> desc.subresources.base_mip_level).max(1),
+            ],
+            aspects,
+        }
+    }
+
+    fn destroy_texture_view(&self, view: super::TextureView) {
+        unsafe { self.device.core.destroy_image_view(view.raw, None) };
+    }
+
+    fn create_sampler(&self, desc: crate::SamplerDesc) -> super::Sampler {
+        let mut vk_info = vk::SamplerCreateInfo {
+            mag_filter: map_filter_mode(desc.mag_filter),
+            min_filter: map_filter_mode(desc.min_filter),
+            mipmap_mode: map_mip_filter_mode(desc.mipmap_filter),
+            address_mode_u: map_address_mode(desc.address_modes[0]),
+            address_mode_v: map_address_mode(desc.address_modes[1]),
+            address_mode_w: map_address_mode(desc.address_modes[2]),
+            min_lod: desc.lod_min_clamp,
+            max_lod: desc.lod_max_clamp.unwrap_or(vk::LOD_CLAMP_NONE),
+            ..Default::default()
+        };
+
+        if let Some(fun) = desc.compare {
+            vk_info.compare_enable = vk::TRUE;
+            vk_info.compare_op = super::map_comparison(fun);
+        }
+        if desc.anisotropy_clamp > 1 {
+            vk_info.anisotropy_enable = vk::TRUE;
+            vk_info.max_anisotropy = desc.anisotropy_clamp as f32;
+        }
+        if let Some(color) = desc.border_color {
+            vk_info.border_color = map_border_color(color);
+        }
+
+        let raw = unsafe { self.device.core.create_sampler(&vk_info, None).unwrap() };
+        if !desc.name.is_empty() {
+            self.set_object_name(raw, desc.name);
+        }
+
+        super::Sampler { raw }
+    }
+
+    fn destroy_sampler(&self, sampler: super::Sampler) {
+        unsafe { self.device.core.destroy_sampler(sampler.raw, None) };
+    }
+
+    fn create_acceleration_structure(
+        &self,
+        desc: crate::AccelerationStructureDesc,
+    ) -> super::AccelerationStructure {
+        let buffer_info = vk::BufferCreateInfo {
+            size: desc.size,
+            usage: vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR
+                | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+            sharing_mode: vk::SharingMode::EXCLUSIVE,
+            ..Default::default()
+        };
+
+        let buffer = unsafe { self.device.core.create_buffer(&buffer_info, None).unwrap() };
+        let requirements = unsafe { self.device.core.get_buffer_memory_requirements(buffer) };
+        let allocation = self.allocate_memory(
+            requirements,
+            crate::Memory::Device,
+            desc.name,
+            self.device.buffer_device_address,
+        );
+
+        unsafe {
+            self.device
+                .core
+                .bind_buffer_memory(buffer, allocation.memory, allocation.offset)
+                .unwrap()
+        };
+
+        let raw_ty = match desc.ty {
+            crate::AccelerationStructureType::TopLevel => {
+                vk::AccelerationStructureTypeKHR::TOP_LEVEL
+            }
+            crate::AccelerationStructureType::BottomLevel => {
+                vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL
+            }
+        };
+        let vk_info = vk::AccelerationStructureCreateInfoKHR {
+            ty: raw_ty,
+            buffer,
+            size: desc.size,
+            ..Default::default()
+        };
+
+        let rt = self.device.ray_tracing.as_ref().unwrap();
+        let raw = unsafe {
+            rt.acceleration_structure
+                .create_acceleration_structure(&vk_info, None)
+                .unwrap()
+        };
+
+        if !desc.name.is_empty() {
+            self.set_object_name(buffer, desc.name);
+            self.set_object_name(raw, desc.name);
+        }
+        super::AccelerationStructure {
+            raw,
+            buffer,
+            memory_handle: allocation.handle,
+            updatable: desc.updatable,
+        }
+    }
+
+    fn destroy_acceleration_structure(&self, acceleration_structure: super::AccelerationStructure) {
+        let rt = self.device.ray_tracing.as_ref().unwrap();
+        unsafe {
+            rt.acceleration_structure
+                .destroy_acceleration_structure(acceleration_structure.raw, None);
+            self.device
+                .core
+                .destroy_buffer(acceleration_structure.buffer, None);
+        }
+        self.free_memory(acceleration_structure.memory_handle);
+    }
+}
+
+fn map_texture_dimension(dimension: crate::TextureDimension) -> vk::ImageType {
+    match dimension {
+        crate::TextureDimension::D1 => vk::ImageType::TYPE_1D,
+        crate::TextureDimension::D2 => vk::ImageType::TYPE_2D,
+        crate::TextureDimension::D3 => vk::ImageType::TYPE_3D,
+    }
+}
+
+fn map_view_dimension(dimension: crate::ViewDimension) -> vk::ImageViewType {
+    use crate::ViewDimension as Vd;
+    match dimension {
+        Vd::D1 => vk::ImageViewType::TYPE_1D,
+        Vd::D1Array => vk::ImageViewType::TYPE_1D_ARRAY,
+        Vd::D2 => vk::ImageViewType::TYPE_2D,
+        Vd::D2Array => vk::ImageViewType::TYPE_2D_ARRAY,
+        Vd::Cube => vk::ImageViewType::CUBE,
+        Vd::CubeArray => vk::ImageViewType::CUBE_ARRAY,
+        Vd::D3 => vk::ImageViewType::TYPE_3D,
+    }
+}
+
+pub(super) fn map_texture_usage(
+    usage: crate::TextureUsage,
+    aspects: crate::TexelAspects,
+) -> vk::ImageUsageFlags {
+    use vk::ImageUsageFlags as Iuf;
+
+    let mut flags = Iuf::empty();
+    if usage.contains(crate::TextureUsage::COPY) {
+        flags |= Iuf::TRANSFER_SRC | Iuf::TRANSFER_DST;
+    }
+    if usage.contains(crate::TextureUsage::RESOURCE) {
+        flags |= vk::ImageUsageFlags::SAMPLED;
+    }
+    if usage.contains(crate::TextureUsage::TARGET) {
+        flags |= if aspects.contains(crate::TexelAspects::COLOR) {
+            vk::ImageUsageFlags::COLOR_ATTACHMENT
+        } else {
+            vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
+        };
+    }
+    if usage.intersects(crate::TextureUsage::STORAGE) {
+        flags |= vk::ImageUsageFlags::STORAGE;
+    }
+    flags
+}
+
+fn map_filter_mode(mode: crate::FilterMode) -> vk::Filter {
+    match mode {
+        crate::FilterMode::Nearest => vk::Filter::NEAREST,
+        crate::FilterMode::Linear => vk::Filter::LINEAR,
+    }
+}
+
+fn map_mip_filter_mode(mode: crate::FilterMode) -> vk::SamplerMipmapMode {
+    match mode {
+        crate::FilterMode::Nearest => vk::SamplerMipmapMode::NEAREST,
+        crate::FilterMode::Linear => vk::SamplerMipmapMode::LINEAR,
+    }
+}
+
+fn map_address_mode(mode: crate::AddressMode) -> vk::SamplerAddressMode {
+    match mode {
+        crate::AddressMode::ClampToEdge => vk::SamplerAddressMode::CLAMP_TO_EDGE,
+        crate::AddressMode::Repeat => vk::SamplerAddressMode::REPEAT,
+        crate::AddressMode::MirrorRepeat => vk::SamplerAddressMode::MIRRORED_REPEAT,
+        crate::AddressMode::ClampToBorder => vk::SamplerAddressMode::CLAMP_TO_BORDER,
+        // wgt::AddressMode::MirrorClamp => vk::SamplerAddressMode::MIRROR_CLAMP_TO_EDGE,
+    }
+}
+
+fn map_border_color(border_color: crate::TextureColor) -> vk::BorderColor {
+    match border_color {
+        crate::TextureColor::TransparentBlack => vk::BorderColor::FLOAT_TRANSPARENT_BLACK,
+        crate::TextureColor::OpaqueBlack => vk::BorderColor::FLOAT_OPAQUE_BLACK,
+        crate::TextureColor::White => vk::BorderColor::FLOAT_OPAQUE_WHITE,
+    }
+}
+
+fn external_source_handle_type(
+    source: crate::ExternalMemorySource,
+) -> vk::ExternalMemoryHandleTypeFlags {
+    match source {
+        #[cfg(target_os = "windows")]
+        crate::ExternalMemorySource::Win32(_) => vk::ExternalMemoryHandleTypeFlags::OPAQUE_WIN32,
+        #[cfg(target_os = "windows")]
+        crate::ExternalMemorySource::Win32KMT(_) => {
+            vk::ExternalMemoryHandleTypeFlags::OPAQUE_WIN32_KMT
+        }
+        #[cfg(not(target_os = "windows"))]
+        crate::ExternalMemorySource::Fd(_) => vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD,
+        #[cfg(target_os = "linux")]
+        crate::ExternalMemorySource::Dma(_) => vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT,
+        crate::ExternalMemorySource::HostAllocation(_) => {
+            vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT
+        }
+    }
+}
+
+fn fetch_external_source(
+    device: &super::Device,
+    allocation: Allocation,
+) -> Option<crate::ExternalMemorySource> {
+    match allocation.memory_type {
+        crate::Memory::External(e) => {
+            match e {
+                #[cfg(not(target_os = "windows"))]
+                crate::ExternalMemorySource::Fd(Some(_)) => return None,
+                #[cfg(target_os = "linux")]
+                crate::ExternalMemorySource::Dma(Some(_)) => return None,
+                crate::ExternalMemorySource::HostAllocation(_) => return Some(e),
+                _ => {}
+            }
+            let device = device
+                .external_memory
+                .as_ref()
+                .expect("External memory is not supported");
+            let memory = allocation.memory;
+            let handle_type = external_source_handle_type(e);
+
+            Some(match e {
+                #[cfg(target_os = "windows")]
+                crate::ExternalMemorySource::Win32KMT(None)
+                | crate::ExternalMemorySource::Win32(None) => {
+                    let info = vk::MemoryGetWin32HandleInfoKHR {
+                        memory,
+                        handle_type,
+                        ..vk::MemoryGetWin32HandleInfoKHR::default()
+                    };
+
+                    let handle = unsafe { device.get_memory_win32_handle(&info).unwrap() };
+                    match e {
+                        crate::ExternalMemorySource::Win32(_) => {
+                            crate::ExternalMemorySource::Win32(Some(handle))
+                        }
+                        crate::ExternalMemorySource::Win32KMT(_) => {
+                            crate::ExternalMemorySource::Win32KMT(Some(handle))
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                #[cfg(not(target_os = "windows"))]
+                crate::ExternalMemorySource::Fd(None) => {
+                    let info = vk::MemoryGetFdInfoKHR {
+                        memory,
+                        handle_type,
+                        ..vk::MemoryGetFdInfoKHR::default()
+                    };
+
+                    let handle = unsafe { device.get_memory_fd(&info).unwrap() };
+                    crate::ExternalMemorySource::Fd(Some(handle))
+                }
+                #[cfg(target_os = "linux")]
+                crate::ExternalMemorySource::Dma(None) => {
+                    let info = vk::MemoryGetFdInfoKHR {
+                        memory,
+                        handle_type,
+                        ..vk::MemoryGetFdInfoKHR::default()
+                    };
+
+                    let handle = unsafe { device.get_memory_fd(&info).unwrap() };
+                    crate::ExternalMemorySource::Dma(Some(handle))
+                }
+
+                //Means its a import, which already knows what its source is
+                _ => e,
+            })
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn geometry_transform_preserves_vulkan_row_major_layout() {
+        let rows = [
+            [1.0, 2.0, 3.0, 4.0],
+            [5.0, 6.0, 7.0, 8.0],
+            [9.0, 10.0, 11.0, 12.0],
+        ];
+        let packed = crate::AccelerationStructureTransform::from(crate::Transform::from(rows));
+        assert_eq!(bytemuck::bytes_of(&packed), bytemuck::bytes_of(&rows));
+        assert_eq!(
+            mem::size_of_val(&packed),
+            mem::size_of::<vk::TransformMatrixKHR>()
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[ignore = "requires native Vulkan OPAQUE_FD support"]
+    fn external_memory_fd_matching_allocation_roundtrip() {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        let gpu = unsafe {
+            super::super::Context::init(crate::ContextDesc {
+                validation: true,
+                device_id: std::env::var("BLADE_DEVICE_ID")
+                    .ok()
+                    .map(|id| id.parse().unwrap()),
+                ..Default::default()
+            })
+            .unwrap()
+        };
+        let device = gpu.device_information();
+        assert!(!device.is_software_emulated);
+        assert_eq!(
+            device.device_name,
+            std::env::var("BLADE_EXPECT_DEVICE_NAME").unwrap()
+        );
+        let memory = gpu.memory_stats();
+        assert!(memory.budget.saturating_sub(memory.usage) >= 2 << 30);
+        let before = gpu.memory.lock().unwrap().slab.len();
+        let upload = gpu.create_buffer(crate::BufferDesc {
+            name: "upload",
+            size: 256,
+            memory: crate::Memory::Shared,
+        });
+        let download = gpu.create_buffer(crate::BufferDesc {
+            name: "download",
+            size: 256,
+            memory: crate::Memory::Shared,
+        });
+        unsafe {
+            std::slice::from_raw_parts_mut(upload.data(), 256).fill(0x5a);
+        }
+        let mut encoder = gpu.create_command_encoder(crate::CommandEncoderDesc {
+            name: "external_alias_roundtrip",
+            buffer_count: 1,
+            manual_barriers: false,
+        });
+        for size in [257, 6208, 16384] {
+            let exported = gpu.create_buffer(crate::BufferDesc {
+                name: "external_allocation",
+                size,
+                memory: crate::Memory::External(crate::ExternalMemorySource::Fd(None)),
+            });
+            let Some(crate::ExternalMemorySource::Fd(Some(fd))) =
+                gpu.get_external_buffer_source(exported)
+            else {
+                panic!("missing export FD");
+            };
+            let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+            let import = || {
+                gpu.create_buffer(crate::BufferDesc {
+                    name: "external_alias",
+                    size,
+                    memory: crate::Memory::External(crate::ExternalMemorySource::Fd(Some(
+                        fd.as_raw_fd(),
+                    ))),
+                })
+            };
+            gpu.destroy_buffer(import());
+            drop(fd.try_clone().unwrap());
+            let imported = import();
+            assert!(gpu.get_external_buffer_source(imported).is_none());
+            drop(fd); // Imports duplicate the FD, never consume the caller's copy.
+            {
+                let manager = gpu.memory.lock().unwrap();
+                let original = &manager.slab[exported.memory_handle].0;
+                let alias = &manager.slab[imported.memory_handle].0;
+                assert_eq!(original.memory_type(), alias.memory_type());
+                assert_eq!(original.size(), alias.size());
+                assert!(original.size() >= size);
+                assert_eq!((original.offset(), alias.offset()), (0, 0));
+                eprintln!(
+                    "buffer={size} allocation={} type={}",
+                    original.size(),
+                    original.memory_type()
+                );
+            }
+            encoder.start();
+            encoder.transfer("write_alias").copy_buffer_to_buffer(
+                upload.into(),
+                exported.into(),
+                256,
+            );
+            encoder.release_external_buffer(exported);
+            assert!(gpu.wait_for(&gpu.submit(&mut encoder), !0).unwrap());
+            encoder.start();
+            encoder.acquire_external_buffer(imported);
+            encoder.transfer("read_alias").copy_buffer_to_buffer(
+                imported.into(),
+                download.into(),
+                256,
+            );
+            encoder.release_external_buffer(imported);
+            assert!(gpu.wait_for(&gpu.submit(&mut encoder), !0).unwrap());
+            assert!(
+                unsafe { std::slice::from_raw_parts(download.data(), 256) }
+                    .iter()
+                    .all(|&byte| byte == 0x5a)
+            );
+            gpu.destroy_buffer(imported);
+            gpu.destroy_buffer(exported);
+        }
+        gpu.destroy_command_encoder(&mut encoder);
+        for buffer in [download, upload] {
+            gpu.destroy_buffer(buffer);
+        }
+        assert_eq!(gpu.memory.lock().unwrap().slab.len(), before);
+    }
+
+    #[test]
+    fn device_address_buffers_request_matching_memory_flags() {
+        assert_eq!(
+            memory_allocate_flags(true),
+            vk::MemoryAllocateFlags::DEVICE_ADDRESS
+        );
+        assert!(memory_allocate_flags(false).is_empty());
+    }
+}

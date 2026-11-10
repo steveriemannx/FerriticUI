@@ -1,0 +1,259 @@
+pub trait ExposeHud {
+    fn populate_hud(&mut self, ui: &mut egui::Ui);
+}
+
+impl ExposeHud for blade_render::RayConfig {
+    fn populate_hud(&mut self, ui: &mut egui::Ui) {
+        ui.add(
+            egui::Slider::new(&mut self.num_environment_samples, 0..=100u32)
+                .text("Num env samples")
+                .logarithmic(true),
+        );
+        ui.add(
+            egui::Slider::new(&mut self.num_brdf_samples, 0..=100u32)
+                .text("Num BRDF samples")
+                .logarithmic(true),
+        );
+        ui.checkbox(&mut self.jitter_primary_rays, "Jitter primary rays");
+        ui.checkbox(
+            &mut self.environment_importance_sampling,
+            "Env importance sampling",
+        );
+        ui.add(egui::widgets::Slider::new(&mut self.max_bounces, 0..=16).text("Max bounces"));
+        ui.add(
+            egui::Slider::new(&mut self.max_accumulated_samples, 0..=4096u32)
+                .text("Accumulation limit")
+                .logarithmic(true),
+        );
+        ui.add(egui::widgets::Slider::new(&mut self.tap_count, 0..=10).text("Tap count"));
+        ui.add(egui::widgets::Slider::new(&mut self.tap_radius, 1..=50).text("Tap radius (px)"));
+        ui.add(
+            egui::widgets::Slider::new(&mut self.tap_confidence_near, 1..=50)
+                .text("Max confidence"),
+        );
+        ui.add(
+            egui::widgets::Slider::new(&mut self.tap_confidence_far, 1..=50).text("Min confidence"),
+        );
+        ui.add(
+            egui::widgets::Slider::new(&mut self.t_start, 0.001..=0.5)
+                .text("T min")
+                .logarithmic(true),
+        );
+        ui.checkbox(&mut self.pairwise_mis, "Pairwise MIS");
+        ui.add(
+            egui::widgets::Slider::new(&mut self.defensive_mis, 0.0..=1.0).text("Defensive MIS"),
+        );
+    }
+}
+
+impl ExposeHud for blade_render::DenoiserConfig {
+    fn populate_hud(&mut self, ui: &mut egui::Ui) {
+        ui.add(egui::Slider::new(&mut self.temporal_weight, 0.0..=1.0f32).text("Temporal weight"));
+        ui.add(egui::Slider::new(&mut self.num_passes, 0..=5u32).text("A-trous passes"));
+    }
+}
+
+impl ExposeHud for blade_render::PostProcConfig {
+    fn populate_hud(&mut self, ui: &mut egui::Ui) {
+        ui.checkbox(&mut self.tone_map, "Tone map");
+        ui.add_enabled_ui(self.tone_map, |ui| {
+            ui.add(
+                egui::Slider::new(&mut self.average_luminocity, 0.1f32..=1_000f32)
+                    .text("Average luminocity")
+                    .logarithmic(true),
+            );
+            ui.add(
+                egui::Slider::new(&mut self.exposure_key_value, 0.01f32..=10f32)
+                    .text("Key value")
+                    .logarithmic(true),
+            );
+            ui.add(egui::Slider::new(&mut self.white_level, 0.1f32..=2f32).text("White level"));
+        });
+    }
+}
+
+impl ExposeHud for blade_render::RasterConfig {
+    fn populate_hud(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label("Clear color");
+            egui::ComboBox::from_id_salt("raster-clear-color")
+                .selected_text(format!("{:?}", self.clear_color))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut self.clear_color,
+                        blade_graphics::TextureColor::TransparentBlack,
+                        "TransparentBlack",
+                    );
+                    ui.selectable_value(
+                        &mut self.clear_color,
+                        blade_graphics::TextureColor::OpaqueBlack,
+                        "OpaqueBlack",
+                    );
+                    ui.selectable_value(
+                        &mut self.clear_color,
+                        blade_graphics::TextureColor::White,
+                        "White",
+                    );
+                });
+        });
+
+        ui.label("Light direction");
+        ui.horizontal(|ui| {
+            ui.add(egui::DragValue::new(&mut self.light_dir.x).speed(0.05));
+            ui.add(egui::DragValue::new(&mut self.light_dir.y).speed(0.05));
+            ui.add(egui::DragValue::new(&mut self.light_dir.z).speed(0.05));
+        });
+
+        let mut light_color = [self.light_color.x, self.light_color.y, self.light_color.z];
+        if ui.color_edit_button_rgb(&mut light_color).changed() {
+            self.light_color = mint::Vector3 {
+                x: light_color[0],
+                y: light_color[1],
+                z: light_color[2],
+            };
+        }
+        ui.label("Light color");
+
+        let mut ambient_color = [
+            self.ambient_color.x,
+            self.ambient_color.y,
+            self.ambient_color.z,
+        ];
+        if ui.color_edit_button_rgb(&mut ambient_color).changed() {
+            self.ambient_color = mint::Vector3 {
+                x: ambient_color[0],
+                y: ambient_color[1],
+                z: ambient_color[2],
+            };
+        }
+        ui.label("Ambient color");
+
+        let mut shadows = self.directional_shadows.is_some();
+        if ui.checkbox(&mut shadows, "Directional shadows").changed() {
+            self.directional_shadows = shadows.then(blade_render::DirectionalShadowConfig::default);
+        }
+    }
+}
+
+impl ExposeHud for blade_render::DebugConfig {
+    fn populate_hud(&mut self, ui: &mut egui::Ui) {
+        use strum::IntoEnumIterator as _;
+
+        egui::ComboBox::from_label("View mode")
+            .selected_text(format!("{:?}", self.view_mode))
+            .show_ui(ui, |ui| {
+                for value in blade_render::DebugMode::iter() {
+                    ui.selectable_value(&mut self.view_mode, value, format!("{value:?}"));
+                }
+            });
+
+        ui.label("Draw debug:");
+        for (name, bit) in blade_render::DebugDrawFlags::all().iter_names() {
+            let mut enabled = self.draw_flags.contains(bit);
+            ui.checkbox(&mut enabled, name);
+            self.draw_flags.set(bit, enabled);
+        }
+        ui.label("Ignore textures:");
+        for (name, bit) in blade_render::DebugTextureFlags::all().iter_names() {
+            let mut enabled = self.texture_flags.contains(bit);
+            ui.checkbox(&mut enabled, name);
+            self.texture_flags.set(bit, enabled);
+        }
+    }
+}
+
+/// Pick the mode of the ray tracer, returning true when it changes.
+pub fn populate_render_mode(mode: &mut blade_render::RenderMode, ui: &mut egui::Ui) -> bool {
+    use strum::IntoEnumIterator as _;
+
+    let old = *mode;
+    egui::ComboBox::from_label("Mode")
+        .selected_text(format!("{mode:?}"))
+        .show_ui(ui, |ui| {
+            for value in blade_render::RenderMode::iter() {
+                ui.selectable_value(mode, value, format!("{value:?}"));
+            }
+        });
+    *mode != old
+}
+
+pub fn populate_debug_selection(
+    mouse_pos: &mut Option<[i32; 2]>,
+    selection: &blade_render::SelectionInfo,
+    asset_hub: &blade_render::AssetHub,
+    ui: &mut egui::Ui,
+) {
+    let screen_pos = match *mouse_pos {
+        Some(pos) => pos,
+        None => return,
+    };
+
+    let style = ui.style();
+    egui::Frame::group(style).show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.label("Pixel:");
+            ui.colored_label(
+                egui::Color32::WHITE,
+                format!("{}x{}", screen_pos[0], screen_pos[1]),
+            );
+            if ui.button("Unselect").clicked() {
+                *mouse_pos = None;
+            }
+        });
+        ui.horizontal(|ui| {
+            let sd = &selection.std_deviation;
+            ui.label("Std Deviation:");
+            ui.colored_label(
+                egui::Color32::WHITE,
+                format!("{:.2} {:.2} {:.2}", sd.x, sd.y, sd.z),
+            );
+        });
+        ui.horizontal(|ui| {
+            ui.label("Samples:");
+            let power = selection
+                .std_deviation_history
+                .next_power_of_two()
+                .trailing_zeros();
+            ui.colored_label(egui::Color32::WHITE, format!("2^{}", power));
+        });
+        ui.horizontal(|ui| {
+            ui.label("Depth:");
+            ui.colored_label(egui::Color32::WHITE, format!("{:.2}", selection.depth));
+        });
+        ui.horizontal(|ui| {
+            let tc = &selection.tex_coords;
+            ui.label("Texture coords:");
+            ui.colored_label(egui::Color32::WHITE, format!("{:.2} {:.2}", tc.x, tc.y));
+        });
+        ui.horizontal(|ui| {
+            let wp = &selection.position;
+            ui.label("World pos:");
+            ui.colored_label(
+                egui::Color32::WHITE,
+                format!("{:.2} {:.2} {:.2}", wp.x, wp.y, wp.z),
+            );
+        });
+        ui.horizontal(|ui| {
+            ui.label("Base color:");
+            if let Some(handle) = selection.base_color_texture {
+                let name = asset_hub
+                    .textures
+                    .get_main_source_path(handle)
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default();
+                ui.colored_label(egui::Color32::WHITE, name);
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Normal:");
+            if let Some(handle) = selection.normal_texture {
+                let name = asset_hub
+                    .textures
+                    .get_main_source_path(handle)
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default();
+                ui.colored_label(egui::Color32::WHITE, name);
+            }
+        });
+    });
+}

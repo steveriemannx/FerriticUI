@@ -1,0 +1,209 @@
+name: check
+
+on:
+  push:
+    branches: ["main"]
+    tags: [v0.*, "*-0.*"]
+  pull_request:
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            full: true
+
+          - name: Windows
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            full: true
+
+          - name: macOS
+            os: macos-latest
+            target: aarch64-apple-darwin
+            full: true
+
+          - name: iOS
+            os: macos-latest
+            target: aarch64-apple-ios
+            full: false
+
+          - name: Web
+            os: ubuntu-latest
+            target: wasm32-unknown-unknown
+            full: false
+
+          - name: Android
+            os: ubuntu-latest
+            target: aarch64-linux-android
+            full: false
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        run: |
+          rustup toolchain install stable --profile minimal --target ${{ matrix.target }}
+          rustup default stable
+
+      - name: Check Basics
+        run: cargo check --target ${{ matrix.target }} --workspace --no-default-features
+
+      - name: Test CPU Basics
+        if: matrix.full
+        run: cargo test -p blade-render --no-default-features
+
+      - name: Test CPU Workspace
+        if: matrix.full
+        run: cargo test --workspace --all-features
+
+      - name: Check GLES
+        if: matrix.name == 'Linux' || matrix.name == 'Windows'
+        run: cargo check --workspace
+        env:
+          RUSTFLAGS: "--cfg gles"
+
+  msrv:
+    name: MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install MSRV toolchain
+        run: |
+          rustup toolchain install 1.92.0 --profile minimal
+          rustup default 1.92.0
+
+      - name: Check MSRV
+        run: cargo check --workspace --no-default-features
+
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt
+          rustup default stable
+
+      - name: Run rustfmt
+        run: cargo fmt -- --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup default stable
+
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets
+
+      - name: Run clippy (GLES)
+        run: cargo clippy --workspace
+        env:
+          RUSTFLAGS: "--cfg gles"
+
+  gpu-test:
+    name: GPU Tests (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-latest
+          - name: macOS
+            os: macos-latest
+          - name: Windows
+            os: windows-latest
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Install Vulkan (Linux)
+        if: matrix.name == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libvulkan1 mesa-vulkan-drivers
+
+      - name: Install Vulkan (Windows)
+        if: matrix.name == 'Windows'
+        uses: jakoch/install-vulkan-sdk-action@v1
+        with:
+          install_runtime: true
+          install_lavapipe: true
+          cache: true
+          # The action queries GitHub for LavaPipe releases. Anonymous hosted
+          # runners share a tiny rate limit and made unrelated PRs fail before
+          # any Vulkan test ran.
+          github_token: ${{ github.token }}
+
+      # One test at a time, as the GLES step below already does. Each of these
+      # stands up its own GPU context, and the ray traced ones also build
+      # acceleration structures and full sized render targets. Ten of those at
+      # once on a shared runner, where the "GPU" is a software rasterizer
+      # competing for the same few cores, stretches the heaviest tests by far
+      # more than the work in them costs.
+      - name: Run GPU integration tests (Linux)
+        if: matrix.name == 'Linux'
+        run: cargo test --test gpu_examples -- --ignored --nocapture --test-threads=1
+        env:
+          VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.json
+
+      - name: Run GPU integration tests
+        if: matrix.name != 'Linux'
+        run: cargo test --test gpu_examples -- --ignored --nocapture --test-threads=1
+
+      - name: Install EGL/GLES (Linux)
+        if: matrix.name == 'Linux'
+        run: sudo apt-get install -y libegl1-mesa-dev libgles2-mesa-dev
+
+      - name: Run GLES integration tests (Linux)
+        if: matrix.name == 'Linux'
+        run: cargo test --test gpu_examples -- --ignored --nocapture --test-threads=1
+        env:
+          RUSTFLAGS: "--cfg gles"
+
+      - name: Install ANGLE (Windows)
+        if: matrix.name == 'Windows'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ANGLE_URL=$(curl -s -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/mmozeiko/build-angle/releases/latest \
+            | python -c "import sys,json; d=json.load(sys.stdin); assets=d['assets']; print([a['browser_download_url'] for a in assets if 'x64' in a['name']][0])")
+          curl -L -o angle.zip "$ANGLE_URL"
+          7z x angle.zip -oangle
+          cp angle/angle-*/bin/*.dll .
+
+      - name: Run GLES integration tests (Windows/ANGLE)
+        if: matrix.name == 'Windows'
+        run: cargo test --test gpu_examples snapshot_bunnymark -- --ignored --nocapture
+        env:
+          RUSTFLAGS: "--cfg gles"
+
+      - name: Upload snapshot artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: snapshots-${{ matrix.name }}
+          path: tests/reference/*_actual.png

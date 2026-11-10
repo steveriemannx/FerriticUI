@@ -1,0 +1,1577 @@
+use ash::vk;
+use std::{ptr, str};
+
+impl super::CrashHandler {
+    fn add_marker(&mut self, marker: &str) -> u32 {
+        if self.next_offset < self.raw_string.len() {
+            self.raw_string[self.next_offset] = b'|';
+            self.next_offset += 1;
+        }
+        let len = marker.len().min(self.raw_string.len());
+        if self.next_offset + len > self.raw_string.len() {
+            self.next_offset = 0;
+        }
+        let start = self.next_offset;
+        self.next_offset += len;
+        let end = self.next_offset;
+        self.raw_string[start..end].copy_from_slice(&marker.as_bytes()[..len]);
+        start as u32 | (end << 16) as u32
+    }
+
+    pub(super) fn extract(&self, id: u32) -> (&str, &str) {
+        let start = id as usize & 0xFFFF;
+        let end = (id >> 16) as usize;
+        let history = str::from_utf8(&self.raw_string[..start]).unwrap_or_default();
+        let marker = str::from_utf8(&self.raw_string[start..end]).unwrap();
+        (history, marker)
+    }
+}
+
+impl super::TimingState {
+    fn resolve(&self, device: &ash::Device) -> crate::Timing<'_> {
+        let calibration = self.calibration.expect("no last submission");
+        let n = self.submitted_count;
+        let mut timestamps = [0u64; super::QUERY_POOL_SIZE];
+        unsafe {
+            device
+                .get_query_pool_results(
+                    self.query_pool,
+                    0,
+                    &mut timestamps[..n + 1],
+                    vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
+                )
+                .unwrap_or_else(|error| panic!("Unable to resolve GPU timestamps: {error}"));
+        }
+        crate::Timing {
+            passes: self
+                .pass_names
+                .iter()
+                .take(n)
+                .zip(timestamps.iter())
+                .map(|(name, &timestamp)| (name, calibration.map(timestamp)))
+                .collect(),
+            done: calibration.map(timestamps[n]),
+        }
+    }
+}
+
+impl super::PipelineContext<'_> {
+    #[inline]
+    fn write<T>(&mut self, index: u32, value: T) {
+        let offset = self.template_offsets[index as usize];
+        unsafe {
+            ptr::write(
+                self.update_data.as_mut_ptr().offset(offset as isize) as *mut T,
+                value,
+            )
+        };
+    }
+
+    #[inline]
+    fn write_array<I: Iterator>(&mut self, index: u32, iter: I) {
+        let count = self.array_counts[index as usize] as usize;
+        assert_eq!(
+            iter.size_hint(),
+            (count, Some(count)),
+            "binding array must fill its layout count"
+        );
+        let base_offset = self.template_offsets[index as usize];
+        let base_ptr =
+            unsafe { self.update_data.as_mut_ptr().offset(base_offset as isize) as *mut I::Item };
+        for (i, value) in iter.enumerate() {
+            unsafe { ptr::write(base_ptr.add(i), value) };
+        }
+    }
+}
+
+impl<T: bytemuck::Pod> crate::ShaderBindable for T {
+    fn bind_to(&self, ctx: &mut super::PipelineContext, index: u32) {
+        if ctx.inline_uniform_mask & (1 << index) != 0 {
+            // Inline uniform block mode: write raw data directly
+            ctx.write(index, *self);
+        } else {
+            // UBO mode: copy data to scratch buffer, then write descriptor
+            let info = {
+                let scratch = ctx
+                    .scratch
+                    .as_mut()
+                    .expect("scratch buffer required for UBO binding");
+                let data = bytemuck::bytes_of(self);
+                let aligned_offset =
+                    (scratch.offset + scratch.alignment - 1) & !(scratch.alignment - 1);
+                let end = aligned_offset + data.len() as u64;
+                assert!(
+                    end <= scratch.capacity,
+                    "Scratch buffer overflow: needed {end}, capacity {}",
+                    scratch.capacity
+                );
+                unsafe {
+                    ptr::copy_nonoverlapping(
+                        data.as_ptr(),
+                        scratch.mapped.add(aligned_offset as usize),
+                        data.len(),
+                    );
+                }
+                scratch.offset = end;
+                vk::DescriptorBufferInfo {
+                    buffer: scratch.raw,
+                    offset: aligned_offset,
+                    range: data.len() as u64,
+                }
+            };
+            ctx.write(index, info);
+        }
+    }
+}
+impl crate::ShaderBindable for super::TextureView {
+    fn bind_to(&self, ctx: &mut super::PipelineContext, index: u32) {
+        ctx.write(
+            index,
+            vk::DescriptorImageInfo {
+                sampler: vk::Sampler::null(),
+                image_view: self.raw,
+                image_layout: vk::ImageLayout::GENERAL,
+            },
+        );
+    }
+}
+impl<'a, const N: crate::ResourceIndex> crate::ShaderBindable for &'a crate::TextureArray<N> {
+    fn bind_to(&self, ctx: &mut super::PipelineContext, index: u32) {
+        let count = ctx.array_counts[index as usize] as usize;
+        assert!(count <= N as usize);
+        assert!(!self.data.is_empty() && self.data.len() <= count);
+        ctx.write_array(
+            index,
+            self.data
+                .iter()
+                .map(|view| vk::DescriptorImageInfo {
+                    sampler: vk::Sampler::null(),
+                    image_view: view.raw,
+                    image_layout: vk::ImageLayout::GENERAL,
+                })
+                .cycle()
+                .take(count),
+        );
+    }
+}
+impl crate::ShaderBindable for super::Sampler {
+    fn bind_to(&self, ctx: &mut super::PipelineContext, index: u32) {
+        ctx.write(
+            index,
+            vk::DescriptorImageInfo {
+                sampler: self.raw,
+                image_view: vk::ImageView::null(),
+                image_layout: vk::ImageLayout::UNDEFINED,
+            },
+        );
+    }
+}
+impl crate::ShaderBindable for crate::BufferPiece {
+    fn bind_to(&self, ctx: &mut super::PipelineContext, index: u32) {
+        ctx.write(
+            index,
+            vk::DescriptorBufferInfo {
+                buffer: self.buffer.raw,
+                offset: self.offset,
+                range: vk::WHOLE_SIZE,
+            },
+        );
+    }
+}
+impl<'a, const N: crate::ResourceIndex> crate::ShaderBindable for &'a crate::BufferArray<N> {
+    fn bind_to(&self, ctx: &mut super::PipelineContext, index: u32) {
+        let count = ctx.array_counts[index as usize] as usize;
+        assert!(count <= N as usize);
+        assert!(!self.data.is_empty() && self.data.len() <= count);
+        ctx.write_array(
+            index,
+            self.data
+                .iter()
+                .map(|piece| vk::DescriptorBufferInfo {
+                    buffer: piece.buffer.raw,
+                    offset: piece.offset,
+                    range: vk::WHOLE_SIZE,
+                })
+                .cycle()
+                .take(count),
+        );
+    }
+}
+impl crate::ShaderBindable for super::AccelerationStructure {
+    fn bind_to(&self, ctx: &mut super::PipelineContext, index: u32) {
+        ctx.write(index, self.raw);
+    }
+}
+impl<'a, const N: crate::ResourceIndex> crate::ShaderBindable
+    for &'a crate::AccelerationStructureArray<N>
+{
+    fn bind_to(&self, ctx: &mut super::PipelineContext, index: u32) {
+        let count = ctx.array_counts[index as usize] as usize;
+        assert!(count <= N as usize);
+        assert!(!self.data.is_empty() && self.data.len() <= count);
+        ctx.write_array(
+            index,
+            self.data.iter().map(|accel| accel.raw).cycle().take(count),
+        );
+    }
+}
+
+impl crate::TexturePiece {
+    fn subresource_layers(&self) -> vk::ImageSubresourceLayers {
+        vk::ImageSubresourceLayers {
+            aspect_mask: super::map_aspects(self.texture.format.aspects()),
+            mip_level: self.mip_level,
+            base_array_layer: self.array_layer,
+            layer_count: 1,
+        }
+    }
+}
+
+fn map_origin(origin: &[u32; 3]) -> vk::Offset3D {
+    vk::Offset3D {
+        x: origin[0] as i32,
+        y: origin[1] as i32,
+        z: origin[2] as i32,
+    }
+}
+
+fn make_buffer_image_copy(
+    buffer: &crate::BufferPiece,
+    bytes_per_row: u32,
+    texture: &crate::TexturePiece,
+    size: &crate::Extent,
+) -> vk::BufferImageCopy {
+    let block_info = texture.texture.format.block_info();
+    vk::BufferImageCopy {
+        buffer_offset: buffer.offset,
+        buffer_row_length: block_info.dimensions.0 as u32
+            * (bytes_per_row / block_info.size as u32),
+        buffer_image_height: 0,
+        image_subresource: texture.subresource_layers(),
+        image_offset: map_origin(&texture.origin),
+        image_extent: super::map_extent_3d(size),
+    }
+}
+
+fn map_render_target(rt: &crate::RenderTarget) -> vk::RenderingAttachmentInfo<'static> {
+    let mut vk_info = vk::RenderingAttachmentInfo::default()
+        .image_view(rt.view.raw)
+        .image_layout(vk::ImageLayout::GENERAL);
+
+    match rt.init_op {
+        crate::InitOp::Load => vk_info = vk_info.load_op(vk::AttachmentLoadOp::LOAD),
+        crate::InitOp::DontCare => vk_info = vk_info.load_op(vk::AttachmentLoadOp::DONT_CARE),
+
+        crate::InitOp::Clear(color) => {
+            let cv = if rt.view.aspects.contains(crate::TexelAspects::COLOR) {
+                vk::ClearValue {
+                    color: match color {
+                        crate::TextureColor::TransparentBlack => {
+                            vk::ClearColorValue { float32: [0.0; 4] }
+                        }
+                        crate::TextureColor::OpaqueBlack => vk::ClearColorValue {
+                            float32: [0.0, 0.0, 0.0, 1.0],
+                        },
+                        crate::TextureColor::White => vk::ClearColorValue { float32: [1.0; 4] },
+                    },
+                }
+            } else {
+                vk::ClearValue {
+                    depth_stencil: vk::ClearDepthStencilValue {
+                        depth: color.depth_clear_value(),
+                        stencil: color.stencil_clear_value(),
+                    },
+                }
+            };
+
+            vk_info = vk_info.load_op(vk::AttachmentLoadOp::CLEAR).clear_value(cv);
+        }
+    }
+
+    if let crate::FinishOp::ResolveTo(resolve_view) = rt.finish_op {
+        vk_info = vk_info
+            .resolve_image_view(resolve_view.raw)
+            .resolve_image_layout(vk::ImageLayout::GENERAL)
+            .resolve_mode(vk::ResolveModeFlags::AVERAGE);
+    }
+
+    vk_info.store_op = match rt.finish_op {
+        crate::FinishOp::Store => vk::AttachmentStoreOp::STORE,
+        crate::FinishOp::Discard => vk::AttachmentStoreOp::DONT_CARE,
+        crate::FinishOp::Ignore => vk::AttachmentStoreOp::DONT_CARE,
+        crate::FinishOp::ResolveTo(..) => {
+            /*
+                TODO: DONT_CARE is most optimal in many cases where the msaa texture itself is never read afterwards but only the resolved,
+                      but how can the user specify this in blade?
+                      https://docs.vulkan.org/samples/latest/samples/performance/msaa/README.html#_best_practice_summary
+            */
+
+            // vk::AttachmentStoreOp::STORE
+            vk::AttachmentStoreOp::DONT_CARE
+        }
+    };
+
+    vk_info
+}
+
+fn end_pass(device: &super::Device, cmd_buf: vk::CommandBuffer) {
+    if device.command_scope.is_some() {
+        unsafe {
+            device.debug_utils.cmd_end_debug_utils_label(cmd_buf);
+        }
+    }
+}
+
+impl super::CommandEncoder {
+    fn add_marker(&mut self, marker: &str) {
+        if let Some(ref mut ch) = self.crash_handler {
+            let id = ch.add_marker(marker);
+            unsafe {
+                self.device
+                    .buffer_marker
+                    .as_ref()
+                    .unwrap()
+                    .cmd_write_buffer_marker(
+                        self.buffers[0].raw,
+                        vk::PipelineStageFlags::ALL_COMMANDS,
+                        ch.marker_buf.raw,
+                        0,
+                        id,
+                    );
+            }
+        }
+    }
+
+    fn add_timestamp(&mut self, label: &str, stage: vk::PipelineStageFlags) {
+        let cmd_buf = self.buffers[0].raw;
+        if let Some(ref mut timing) = self.timing {
+            let index = timing.pass_names.len() - timing.submitted_count;
+            if index == crate::limits::PASS_COUNT {
+                log::warn!("Reached the maximum for `limits::PASS_COUNT`, skipping the timer");
+                return;
+            }
+            let query_pool = timing.query_pool;
+            unsafe {
+                self.device
+                    .core
+                    .cmd_write_timestamp(cmd_buf, stage, query_pool, index as u32);
+            }
+            timing.pass_names.push(label);
+        }
+    }
+
+    fn begin_pass(&mut self, label: &str, kind: super::PassKind) {
+        let inserted = if !self.manual_barriers {
+            self.barrier_before(kind)
+        } else {
+            None
+        };
+        let boundary = inserted.or(self.boundary_source.take());
+        // Keep the history in manual mode as well: the next explicit barrier
+        // must cover every pass recorded since the previous one.
+        self.producer_kinds.insert(kind);
+        self.add_marker(label);
+        self.add_timestamp(label, Self::timestamp_stage(boundary));
+
+        if let Some(_) = self.device.command_scope {
+            self.temp_label.clear();
+            self.temp_label.extend_from_slice(label.as_bytes());
+            self.temp_label.push(0);
+            unsafe {
+                self.device.debug_utils.cmd_begin_debug_utils_label(
+                    self.buffers[0].raw,
+                    &vk::DebugUtilsLabelEXT {
+                        p_label_name: self.temp_label.as_ptr() as *const _,
+                        ..Default::default()
+                    },
+                )
+            }
+        }
+    }
+
+    pub(super) fn finish(&mut self) -> vk::CommandBuffer {
+        // A later queue consumer is not known here, so keep the destination
+        // conservative while deriving the source from the passes that ran.
+        let boundary = self
+            .barrier_before(super::PassKind::Unknown)
+            .or(self.boundary_source.take());
+        self.add_marker("finish");
+        let done = self.timing.as_ref().map(|timing| {
+            (
+                (timing.pass_names.len() - timing.submitted_count) as u32,
+                timing.query_pool,
+                Self::timestamp_stage(boundary),
+            )
+        });
+        let cmd_buf = self.buffers.first_mut().unwrap();
+        unsafe {
+            if let Some((done_index, query_pool, stage)) = done {
+                self.device
+                    .core
+                    .cmd_write_timestamp(cmd_buf.raw, stage, query_pool, done_index);
+            }
+            self.device.core.end_command_buffer(cmd_buf.raw).unwrap();
+        }
+        cmd_buf.raw
+    }
+
+    /// Stages and write accesses a pass of this kind may have produced.
+    fn source_scope(kind: super::PassKind) -> (vk::PipelineStageFlags, vk::AccessFlags) {
+        use super::PassKind as Pk;
+        match kind {
+            Pk::Transfer => (
+                vk::PipelineStageFlags::TRANSFER,
+                vk::AccessFlags::TRANSFER_WRITE,
+            ),
+            Pk::AccelerationStructure => (
+                vk::PipelineStageFlags::ACCELERATION_STRUCTURE_BUILD_KHR
+                    | vk::PipelineStageFlags::TRANSFER,
+                vk::AccessFlags::ACCELERATION_STRUCTURE_WRITE_KHR | vk::AccessFlags::TRANSFER_WRITE,
+            ),
+            Pk::Compute => (
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::AccessFlags::SHADER_WRITE,
+            ),
+            // Shader stores can happen at any graphics stage, in addition to
+            // attachment writes at the fragment-output stages.
+            Pk::Render => (
+                vk::PipelineStageFlags::ALL_GRAPHICS,
+                vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+                    | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE
+                    | vk::AccessFlags::SHADER_WRITE,
+            ),
+            Pk::Unknown => (
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::AccessFlags::MEMORY_WRITE,
+            ),
+        }
+    }
+
+    /// Stages and accesses a pass of this kind may consume.
+    fn destination_scope(
+        kind: super::PassKind,
+        ray_tracing: bool,
+    ) -> (vk::PipelineStageFlags, vk::AccessFlags) {
+        use super::PassKind as Pk;
+        let mut shader_access = vk::AccessFlags::SHADER_READ
+            | vk::AccessFlags::SHADER_WRITE
+            | vk::AccessFlags::UNIFORM_READ;
+        if ray_tracing {
+            // A ray query in a compute or graphics shader reads an
+            // acceleration structure at that shader's stage.
+            shader_access |= vk::AccessFlags::ACCELERATION_STRUCTURE_READ_KHR;
+        }
+        match kind {
+            Pk::Transfer => (
+                vk::PipelineStageFlags::TRANSFER,
+                vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE,
+            ),
+            Pk::AccelerationStructure => (
+                vk::PipelineStageFlags::ACCELERATION_STRUCTURE_BUILD_KHR
+                    | vk::PipelineStageFlags::TRANSFER,
+                vk::AccessFlags::ACCELERATION_STRUCTURE_READ_KHR
+                    | vk::AccessFlags::ACCELERATION_STRUCTURE_WRITE_KHR
+                    | vk::AccessFlags::TRANSFER_READ
+                    | vk::AccessFlags::TRANSFER_WRITE
+                    // Geometry input buffers use SHADER_READ at the
+                    // acceleration-structure build stage.
+                    | vk::AccessFlags::SHADER_READ,
+            ),
+            // DRAW_INDIRECT covers dispatch-indirect argument reads.
+            Pk::Compute => (
+                vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::DRAW_INDIRECT,
+                shader_access | vk::AccessFlags::INDIRECT_COMMAND_READ,
+            ),
+            Pk::Render => (
+                vk::PipelineStageFlags::ALL_GRAPHICS,
+                shader_access
+                    | vk::AccessFlags::INDIRECT_COMMAND_READ
+                    | vk::AccessFlags::INDEX_READ
+                    | vk::AccessFlags::VERTEX_ATTRIBUTE_READ
+                    | vk::AccessFlags::COLOR_ATTACHMENT_READ
+                    | vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+                    | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ
+                    | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+            ),
+            Pk::Unknown => (
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE,
+            ),
+        }
+    }
+
+    fn producer_scope(
+        producer_kinds: super::PassKinds,
+    ) -> (vk::PipelineStageFlags, vk::AccessFlags) {
+        use super::PassKind as Pk;
+        if producer_kinds.contains(Pk::Unknown) {
+            return Self::source_scope(Pk::Unknown);
+        }
+
+        let mut stages = vk::PipelineStageFlags::empty();
+        let mut accesses = vk::AccessFlags::empty();
+        for kind in [
+            Pk::Transfer,
+            Pk::AccelerationStructure,
+            Pk::Compute,
+            Pk::Render,
+        ] {
+            if producer_kinds.contains(kind) {
+                let (kind_stages, kind_accesses) = Self::source_scope(kind);
+                stages |= kind_stages;
+                accesses |= kind_accesses;
+            }
+        }
+        (stages, accesses)
+    }
+
+    /// Stage flag for a timestamp written at a barrier with this source.
+    ///
+    /// `vkCmdWriteTimestamp` accepts one stage. A source that is already one
+    /// flag, including `ALL_GRAPHICS` and `ALL_COMMANDS`, is that completion.
+    /// A combination is widened to `ALL_COMMANDS`. No barrier means nothing
+    /// earlier in this buffer has to retire, so the sample is `TOP_OF_PIPE`.
+    fn timestamp_stage(source: Option<vk::PipelineStageFlags>) -> vk::PipelineStageFlags {
+        match source {
+            Some(stage) if stage.as_raw().count_ones() == 1 => stage,
+            Some(_) => vk::PipelineStageFlags::ALL_COMMANDS,
+            None => vk::PipelineStageFlags::TOP_OF_PIPE,
+        }
+    }
+
+    /// Insert a global memory barrier at the current pass boundary.
+    ///
+    /// The source covers all passes recorded since the previous barrier. A
+    /// caller-placed barrier remains immediate and uses a conservative
+    /// destination because its consumer has not been declared yet.
+    pub fn barrier(&mut self) {
+        self.boundary_source = self.barrier_before(super::PassKind::Unknown);
+    }
+
+    fn barrier_before(&mut self, consumer: super::PassKind) -> Option<vk::PipelineStageFlags> {
+        if self.producer_kinds.is_empty() {
+            return None;
+        }
+
+        let unknown_producer = self.producer_kinds.contains(super::PassKind::Unknown);
+        let (src_stage_mask, mut src_access_mask) = Self::producer_scope(self.producer_kinds);
+        let (dst_stage_mask, mut dst_access_mask) =
+            Self::destination_scope(consumer, self.device.ray_tracing.is_some());
+        let wa = &self.device.workarounds;
+        if unknown_producer {
+            // Preserve the broad-barrier workaround for work whose kind is
+            // unknown. Known pass kinds spell out transfer and AS accesses.
+            src_access_mask |= wa.extra_sync_src_access;
+        }
+        if consumer == super::PassKind::Unknown {
+            dst_access_mask |= wa.extra_sync_dst_access;
+        }
+        self.producer_kinds.clear();
+        let barrier = vk::MemoryBarrier {
+            src_access_mask,
+            dst_access_mask,
+            ..Default::default()
+        };
+        unsafe {
+            self.device.core.cmd_pipeline_barrier(
+                self.buffers[0].raw,
+                src_stage_mask,
+                dst_stage_mask,
+                vk::DependencyFlags::empty(),
+                &[barrier],
+                &[],
+                &[],
+            );
+        }
+        Some(src_stage_mask)
+    }
+
+    pub fn transfer(&mut self, label: &str) -> super::TransferCommandEncoder<'_> {
+        self.begin_pass(label, super::PassKind::Transfer);
+        super::TransferCommandEncoder {
+            raw: self.buffers[0].raw,
+            device: &self.device,
+        }
+    }
+
+    pub fn acceleration_structure(
+        &mut self,
+        label: &str,
+    ) -> super::AccelerationStructureCommandEncoder<'_> {
+        self.begin_pass(label, super::PassKind::AccelerationStructure);
+        super::AccelerationStructureCommandEncoder {
+            raw: self.buffers[0].raw,
+            device: &self.device,
+        }
+    }
+
+    pub fn compute(&mut self, label: &str) -> super::ComputeCommandEncoder<'_> {
+        self.begin_pass(label, super::PassKind::Compute);
+        super::ComputeCommandEncoder {
+            cmd_buf: self.buffers.first_mut().unwrap(),
+            device: &self.device,
+            update_data: &mut self.update_data,
+        }
+    }
+
+    pub fn render(
+        &mut self,
+        label: &str,
+        targets: crate::RenderTargetSet,
+    ) -> super::RenderCommandEncoder<'_> {
+        self.begin_pass(label, super::PassKind::Render);
+
+        let mut target_size = [0u16; 2];
+        let mut color_attachments = Vec::with_capacity(targets.colors.len());
+        let depth_stencil_attachment;
+        for rt in targets.colors {
+            target_size = rt.view.target_size;
+            color_attachments.push(map_render_target(rt));
+        }
+
+        let mut rendering_info = vk::RenderingInfoKHR::default()
+            .layer_count(1)
+            .color_attachments(&color_attachments);
+
+        if let Some(rt) = targets.depth_stencil {
+            target_size = rt.view.target_size;
+            depth_stencil_attachment = map_render_target(&rt);
+            if rt.view.aspects.contains(crate::TexelAspects::DEPTH) {
+                rendering_info = rendering_info.depth_attachment(&depth_stencil_attachment);
+            }
+            if rt.view.aspects.contains(crate::TexelAspects::STENCIL) {
+                rendering_info = rendering_info.stencil_attachment(&depth_stencil_attachment);
+            }
+        }
+
+        let render_area = crate::ScissorRect {
+            x: 0,
+            y: 0,
+            w: target_size[0] as u32,
+            h: target_size[1] as u32,
+        }
+        .to_vk();
+        let viewport = crate::Viewport {
+            x: 0.0,
+            y: 0.0,
+            w: target_size[0] as f32,
+            h: target_size[1] as f32,
+            depth: 0.0..1.0,
+        }
+        .to_vk();
+        rendering_info.render_area = render_area;
+
+        let cmd_buf = self.buffers.first_mut().unwrap();
+        unsafe {
+            self.device
+                .core
+                .cmd_set_viewport(cmd_buf.raw, 0, &[viewport]);
+            self.device
+                .core
+                .cmd_set_scissor(cmd_buf.raw, 0, &[render_area]);
+            self.device
+                .dynamic_rendering
+                .cmd_begin_rendering(cmd_buf.raw, &rendering_info);
+        };
+
+        super::RenderCommandEncoder {
+            cmd_buf,
+            device: &self.device,
+            update_data: &mut self.update_data,
+        }
+    }
+
+    pub(super) fn check_gpu_crash<T>(&self, ret: Result<T, vk::Result>) -> Option<T> {
+        match ret {
+            Ok(value) => Some(value),
+            Err(vk::Result::ERROR_DEVICE_LOST) => match self.crash_handler {
+                Some(ref ch) => {
+                    let last_id = unsafe { *(ch.marker_buf.data() as *mut u32) };
+                    if last_id != 0 {
+                        let (history, last_marker) = ch.extract(last_id);
+                        log::error!("Last GPU executed marker is '{last_marker}'");
+                        log::info!("Marker history: {}", history);
+                    }
+                    panic!("GPU has crashed in {}", ch.name);
+                }
+                None => {
+                    panic!("GPU has crashed, and no debug information is available.");
+                }
+            },
+            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                log::warn!("GPU frame is out of date");
+                None
+            }
+            Err(other) => panic!("GPU error {}", other),
+        }
+    }
+}
+
+#[hidden_trait::expose]
+impl crate::traits::CommandEncoder for super::CommandEncoder {
+    type Texture = super::Texture;
+    type Frame = super::Frame;
+
+    fn start(&mut self) {
+        self.producer_kinds.clear();
+        self.boundary_source = None;
+        if !self.manual_barriers {
+            // Preserve the automatic barrier before the first pass. Its source
+            // is work from an earlier submission, so its kind is unknown.
+            // Manual mode already relies on the prior submission's finish
+            // barrier and starts accumulating at its first recorded pass.
+            self.producer_kinds.insert(super::PassKind::Unknown);
+        }
+        self.buffers.rotate_left(1);
+        if let Some(ref mut timing) = self.timing {
+            timing.pass_names.truncate(timing.submitted_count);
+        }
+        let cmd_buf = self.buffers.first_mut().unwrap();
+        self.device
+            .reset_descriptor_pool(&mut cmd_buf.descriptor_pool);
+        if let Some(ref mut scratch) = cmd_buf.scratch {
+            scratch.offset = 0;
+        }
+
+        let vk_info = vk::CommandBufferBeginInfo {
+            flags: vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT,
+            ..Default::default()
+        };
+        unsafe {
+            self.device
+                .core
+                .begin_command_buffer(cmd_buf.raw, &vk_info)
+                .unwrap();
+        }
+
+        if let Some(ref timing) = self.timing {
+            let query_pool = timing.query_pool;
+            unsafe {
+                self.device.core.cmd_reset_query_pool(
+                    cmd_buf.raw,
+                    query_pool,
+                    0,
+                    super::QUERY_POOL_SIZE as u32,
+                );
+            }
+        }
+    }
+
+    fn init_texture(&mut self, texture: super::Texture) {
+        let barrier = vk::ImageMemoryBarrier {
+            old_layout: vk::ImageLayout::UNDEFINED,
+            new_layout: vk::ImageLayout::GENERAL,
+            image: texture.raw,
+            subresource_range: vk::ImageSubresourceRange {
+                aspect_mask: super::map_aspects(texture.format.aspects()),
+                base_mip_level: 0,
+                level_count: vk::REMAINING_MIP_LEVELS,
+                base_array_layer: 0,
+                layer_count: vk::REMAINING_ARRAY_LAYERS,
+            },
+            ..Default::default()
+        };
+        unsafe {
+            self.device.core.cmd_pipeline_barrier(
+                self.buffers[0].raw,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[barrier],
+            );
+        }
+    }
+
+    fn present(&mut self, frame: super::Frame) {
+        let [width, height] = frame.swapchain.target_size;
+        let whole = crate::ScissorRect {
+            x: 0,
+            y: 0,
+            w: width.into(),
+            h: height.into(),
+        };
+        self.present_with_damage(frame, &[whole]);
+    }
+
+    fn present_with_damage(&mut self, frame: super::Frame, damage: &[crate::ScissorRect]) {
+        self.present_damage.clear();
+        let image_index = match frame.image_index {
+            Some(index) => index,
+            None => {
+                //Note: image was out of date, we can't present it
+                return;
+            }
+        };
+
+        assert!(self.present.is_none());
+        let wa = &self.device.workarounds;
+        self.present = Some(if frame.xr_swapchain != 0 {
+            super::Presentation::Xr {
+                swapchain: frame.xr_swapchain,
+                view_count: frame.xr_view_count,
+                target_size: frame.swapchain.target_size,
+                views: frame.xr_views,
+            }
+        } else {
+            let barrier = vk::ImageMemoryBarrier {
+                old_layout: vk::ImageLayout::GENERAL,
+                new_layout: vk::ImageLayout::PRESENT_SRC_KHR,
+                image: frame.internal.image,
+                subresource_range: vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                },
+                src_access_mask: vk::AccessFlags::MEMORY_WRITE | wa.extra_sync_src_access,
+                ..Default::default()
+            };
+            unsafe {
+                self.device.core.cmd_pipeline_barrier(
+                    self.buffers[0].raw,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[barrier],
+                );
+            }
+            if self.device.incremental_present {
+                // The spec wants every rectangle inside the image.
+                let [width, height] = frame.swapchain.target_size.map(i64::from);
+                for rect in damage {
+                    let x = i64::from(rect.x).clamp(0, width);
+                    let y = i64::from(rect.y).clamp(0, height);
+                    let right = (i64::from(rect.x) + i64::from(rect.w)).clamp(x, width);
+                    let bottom = (i64::from(rect.y) + i64::from(rect.h)).clamp(y, height);
+                    if right > x && bottom > y {
+                        self.present_damage.push(vk::RectLayerKHR {
+                            offset: vk::Offset2D {
+                                x: x as i32,
+                                y: y as i32,
+                            },
+                            extent: vk::Extent2D {
+                                width: (right - x) as u32,
+                                height: (bottom - y) as u32,
+                            },
+                            layer: 0,
+                        });
+                    }
+                }
+                // Zero rectangles would mean the whole image to Vulkan. The
+                // image still goes back to the presentation engine, which needs
+                // it, but with an empty rectangle saying nothing changed.
+                if self.present_damage.is_empty() {
+                    self.present_damage.push(vk::RectLayerKHR::default());
+                }
+            }
+            super::Presentation::Window {
+                swapchain: frame.swapchain.raw,
+                image_index,
+                acquire_semaphore: frame.internal.acquire_semaphore,
+                present_semaphore: frame.internal.present_semaphore,
+            }
+        });
+    }
+
+    fn last_timing(&self) -> crate::Timing<'_> {
+        self.timing
+            .as_ref()
+            .expect("GPU timing is not enabled")
+            .resolve(&self.device.core)
+    }
+}
+
+#[hidden_trait::expose]
+impl crate::traits::TransferEncoder for super::TransferCommandEncoder<'_> {
+    type BufferPiece = crate::BufferPiece;
+    type TexturePiece = crate::TexturePiece;
+
+    fn fill_buffer(&mut self, dst: crate::BufferPiece, size: u64, value: u8) {
+        let value_u32 = (value as u32) * 0x1010101;
+        unsafe {
+            self.device
+                .core
+                .cmd_fill_buffer(self.raw, dst.buffer.raw, dst.offset, size, value_u32)
+        };
+    }
+
+    fn copy_buffer_to_buffer(
+        &mut self,
+        src: crate::BufferPiece,
+        dst: crate::BufferPiece,
+        size: u64,
+    ) {
+        let copy = vk::BufferCopy {
+            src_offset: src.offset,
+            dst_offset: dst.offset,
+            size,
+        };
+        unsafe {
+            self.device
+                .core
+                .cmd_copy_buffer(self.raw, src.buffer.raw, dst.buffer.raw, &[copy])
+        };
+    }
+
+    fn copy_texture_to_texture(
+        &mut self,
+        src: crate::TexturePiece,
+        dst: crate::TexturePiece,
+        size: crate::Extent,
+    ) {
+        let copy = vk::ImageCopy {
+            src_subresource: src.subresource_layers(),
+            src_offset: map_origin(&src.origin),
+            dst_subresource: dst.subresource_layers(),
+            dst_offset: map_origin(&dst.origin),
+            extent: super::map_extent_3d(&size),
+        };
+        unsafe {
+            self.device.core.cmd_copy_image(
+                self.raw,
+                src.texture.raw,
+                vk::ImageLayout::GENERAL,
+                dst.texture.raw,
+                vk::ImageLayout::GENERAL,
+                &[copy],
+            )
+        };
+    }
+
+    fn copy_buffer_to_texture(
+        &mut self,
+        src: crate::BufferPiece,
+        bytes_per_row: u32,
+        dst: crate::TexturePiece,
+        size: crate::Extent,
+    ) {
+        let copy = make_buffer_image_copy(&src, bytes_per_row, &dst, &size);
+        unsafe {
+            self.device.core.cmd_copy_buffer_to_image(
+                self.raw,
+                src.buffer.raw,
+                dst.texture.raw,
+                vk::ImageLayout::GENERAL,
+                &[copy],
+            )
+        };
+    }
+
+    fn copy_texture_to_buffer(
+        &mut self,
+        src: crate::TexturePiece,
+        dst: crate::BufferPiece,
+        bytes_per_row: u32,
+        size: crate::Extent,
+    ) {
+        let copy = make_buffer_image_copy(&dst, bytes_per_row, &src, &size);
+        unsafe {
+            self.device.core.cmd_copy_image_to_buffer(
+                self.raw,
+                src.texture.raw,
+                vk::ImageLayout::GENERAL,
+                dst.buffer.raw,
+                &[copy],
+            )
+        };
+    }
+}
+
+impl Drop for super::TransferCommandEncoder<'_> {
+    fn drop(&mut self) {
+        end_pass(self.device, self.raw);
+    }
+}
+
+impl super::AccelerationStructureCommandEncoder<'_> {
+    fn encode_bottom_level(
+        &mut self,
+        acceleration_structure: super::AccelerationStructure,
+        meshes: &[crate::AccelerationStructureMesh],
+        scratch_data: crate::BufferPiece,
+        mode: vk::BuildAccelerationStructureModeKHR,
+    ) {
+        let rt = self.device.ray_tracing.as_ref().unwrap();
+        let mut blas_input = self
+            .device
+            .map_acceleration_structure_meshes(meshes, acceleration_structure.updatable);
+        blas_input.build_info.mode = mode;
+        if mode == vk::BuildAccelerationStructureModeKHR::UPDATE {
+            blas_input.build_info.src_acceleration_structure = acceleration_structure.raw;
+        }
+        blas_input.build_info.dst_acceleration_structure = acceleration_structure.raw;
+        let scratch_address = self.device.get_device_address(&scratch_data);
+        assert_eq!(
+            scratch_address & rt.scratch_buffer_alignment,
+            0,
+            "BLAS scratch address {scratch_address} is not aligned"
+        );
+        blas_input.build_info.scratch_data = vk::DeviceOrHostAddressKHR {
+            device_address: scratch_address,
+        };
+
+        unsafe {
+            rt.acceleration_structure.cmd_build_acceleration_structures(
+                self.raw,
+                &[blas_input.build_info],
+                &[&blas_input.build_range_infos],
+            );
+        }
+    }
+}
+
+#[hidden_trait::expose]
+impl crate::traits::AccelerationStructureEncoder
+    for super::AccelerationStructureCommandEncoder<'_>
+{
+    type AccelerationStructure = crate::AccelerationStructure;
+    type AccelerationStructureMesh = crate::AccelerationStructureMesh;
+    type BufferPiece = crate::BufferPiece;
+
+    fn build_bottom_level(
+        &mut self,
+        acceleration_structure: super::AccelerationStructure,
+        meshes: &[crate::AccelerationStructureMesh],
+        scratch_data: crate::BufferPiece,
+    ) {
+        self.encode_bottom_level(
+            acceleration_structure,
+            meshes,
+            scratch_data,
+            vk::BuildAccelerationStructureModeKHR::BUILD,
+        );
+    }
+
+    fn update_bottom_level(
+        &mut self,
+        acceleration_structure: super::AccelerationStructure,
+        meshes: &[crate::AccelerationStructureMesh],
+        scratch_data: crate::BufferPiece,
+    ) {
+        self.encode_bottom_level(
+            acceleration_structure,
+            meshes,
+            scratch_data,
+            vk::BuildAccelerationStructureModeKHR::UPDATE,
+        );
+    }
+
+    fn build_top_level(
+        &mut self,
+        acceleration_structure: super::AccelerationStructure,
+        _bottom_level: &[super::AccelerationStructure],
+        instance_count: u32,
+        instance_data: crate::BufferPiece,
+        scratch_data: crate::BufferPiece,
+    ) {
+        let build_range_info = vk::AccelerationStructureBuildRangeInfoKHR {
+            primitive_count: instance_count,
+            primitive_offset: 0,
+            first_vertex: 0,
+            transform_offset: 0,
+        };
+        let geometry = vk::AccelerationStructureGeometryKHR {
+            geometry_type: vk::GeometryTypeKHR::INSTANCES,
+            geometry: vk::AccelerationStructureGeometryDataKHR {
+                instances: vk::AccelerationStructureGeometryInstancesDataKHR {
+                    data: vk::DeviceOrHostAddressConstKHR {
+                        device_address: self.device.get_device_address(&instance_data),
+                    },
+                    ..Default::default()
+                },
+            },
+            ..Default::default()
+        };
+        let geometries = [geometry];
+        let build_info = vk::AccelerationStructureBuildGeometryInfoKHR {
+            ty: vk::AccelerationStructureTypeKHR::TOP_LEVEL,
+            mode: vk::BuildAccelerationStructureModeKHR::BUILD,
+            scratch_data: vk::DeviceOrHostAddressKHR {
+                device_address: self.device.get_device_address(&scratch_data),
+            },
+            dst_acceleration_structure: acceleration_structure.raw,
+            ..Default::default()
+        }
+        .geometries(&geometries);
+
+        let rt = self.device.ray_tracing.as_ref().unwrap();
+        unsafe {
+            rt.acceleration_structure.cmd_build_acceleration_structures(
+                self.raw,
+                &[build_info],
+                &[&[build_range_info]],
+            );
+        }
+    }
+}
+
+impl Drop for super::AccelerationStructureCommandEncoder<'_> {
+    fn drop(&mut self) {
+        end_pass(self.device, self.raw);
+    }
+}
+
+impl<'a> super::ComputeCommandEncoder<'a> {
+    /// Insert a compute-to-compute memory barrier within the current pass.
+    ///
+    /// Ensures that storage buffer writes from preceding dispatches are
+    /// visible to subsequent dispatches, without ending the compute pass.
+    /// Uses `COMPUTE_SHADER` stage scope since this is inherently a
+    /// compute-only synchronization point.
+    pub fn barrier(&mut self) {
+        let barrier = vk::MemoryBarrier {
+            src_access_mask: vk::AccessFlags::SHADER_WRITE,
+            dst_access_mask: vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+            ..Default::default()
+        };
+        unsafe {
+            self.device.core.cmd_pipeline_barrier(
+                self.cmd_buf.raw,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[barrier],
+                &[],
+                &[],
+            );
+        }
+    }
+
+    pub fn with<'b, 'p>(
+        &'b mut self,
+        pipeline: &'p super::ComputePipeline,
+    ) -> super::PipelineEncoder<'b, 'p> {
+        let bind_point = vk::PipelineBindPoint::COMPUTE;
+        unsafe {
+            self.device
+                .core
+                .cmd_bind_pipeline(self.cmd_buf.raw, bind_point, pipeline.raw)
+        };
+        super::PipelineEncoder {
+            cmd_buf: self.cmd_buf,
+            layout: &pipeline.layout,
+            bind_point,
+            device: self.device,
+            update_data: self.update_data,
+        }
+    }
+}
+
+impl Drop for super::ComputeCommandEncoder<'_> {
+    fn drop(&mut self) {
+        end_pass(self.device, self.cmd_buf.raw);
+    }
+}
+
+impl<'a> super::RenderCommandEncoder<'a> {
+    pub fn with<'b, 'p>(
+        &'b mut self,
+        pipeline: &'p super::RenderPipeline,
+    ) -> super::PipelineEncoder<'b, 'p> {
+        let bind_point = vk::PipelineBindPoint::GRAPHICS;
+        unsafe {
+            self.device
+                .core
+                .cmd_bind_pipeline(self.cmd_buf.raw, bind_point, pipeline.raw)
+        };
+        super::PipelineEncoder {
+            cmd_buf: self.cmd_buf,
+            layout: &pipeline.layout,
+            bind_point,
+            device: self.device,
+            update_data: self.update_data,
+        }
+    }
+}
+
+impl Drop for super::RenderCommandEncoder<'_> {
+    fn drop(&mut self) {
+        unsafe {
+            self.device
+                .dynamic_rendering
+                .cmd_end_rendering(self.cmd_buf.raw)
+        };
+        end_pass(self.device, self.cmd_buf.raw);
+    }
+}
+
+impl crate::ScissorRect {
+    const fn to_vk(&self) -> vk::Rect2D {
+        vk::Rect2D {
+            offset: vk::Offset2D {
+                x: self.x,
+                y: self.y,
+            },
+            extent: vk::Extent2D {
+                width: self.w,
+                height: self.h,
+            },
+        }
+    }
+}
+
+impl crate::Viewport {
+    fn to_vk(&self) -> vk::Viewport {
+        vk::Viewport {
+            x: self.x,
+            y: self.y + self.h, // shift since always flipped y and vulkan >= 1.1
+            width: self.w,
+            height: -self.h, // flip Y
+            min_depth: self.depth.start,
+            max_depth: self.depth.end,
+        }
+    }
+}
+
+#[hidden_trait::expose]
+impl crate::traits::RenderEncoder for super::RenderCommandEncoder<'_> {
+    fn set_scissor_rect(&mut self, rect: &crate::ScissorRect) {
+        let vk_scissor = rect.to_vk();
+        unsafe {
+            self.device
+                .core
+                .cmd_set_scissor(self.cmd_buf.raw, 0, &[vk_scissor])
+        };
+    }
+
+    fn set_viewport(&mut self, viewport: &crate::Viewport) {
+        let vk_viewport = viewport.to_vk();
+        unsafe {
+            self.device
+                .core
+                .cmd_set_viewport(self.cmd_buf.raw, 0, &[vk_viewport])
+        };
+    }
+
+    fn set_stencil_reference(&mut self, reference: u32) {
+        unsafe {
+            self.device.core.cmd_set_stencil_reference(
+                self.cmd_buf.raw,
+                vk::StencilFaceFlags::FRONT_AND_BACK,
+                reference,
+            )
+        };
+    }
+}
+
+#[hidden_trait::expose]
+impl crate::traits::PipelineEncoder for super::PipelineEncoder<'_, '_> {
+    fn bind<D: crate::ShaderData>(&mut self, group: u32, data: &D) {
+        let dsl = &self.layout.descriptor_set_layouts[group as usize];
+        if !dsl.is_empty() {
+            self.update_data.clear();
+            self.update_data.resize(dsl.template_size as usize, 0);
+            data.fill(super::PipelineContext {
+                update_data: self.update_data.as_mut_slice(),
+                template_offsets: &dsl.template_offsets,
+                array_counts: &dsl.array_counts,
+                scratch: self.cmd_buf.scratch.as_mut(),
+                inline_uniform_mask: dsl.inline_uniform_mask,
+            });
+        }
+
+        let vk_set = self
+            .device
+            .allocate_descriptor_set(&mut self.cmd_buf.descriptor_pool, dsl);
+        unsafe {
+            if !dsl.is_empty() {
+                self.device.core.update_descriptor_set_with_template(
+                    vk_set,
+                    dsl.update_template,
+                    self.update_data.as_ptr() as *const _,
+                );
+            }
+            self.device.core.cmd_bind_descriptor_sets(
+                self.cmd_buf.raw,
+                self.bind_point,
+                self.layout.raw,
+                group,
+                &[vk_set],
+                &[],
+            );
+        }
+    }
+}
+
+#[hidden_trait::expose]
+impl crate::traits::ComputePipelineEncoder for super::PipelineEncoder<'_, '_> {
+    type BufferPiece = crate::BufferPiece;
+
+    fn dispatch(&mut self, groups: [u32; 3]) {
+        unsafe {
+            self.device
+                .core
+                .cmd_dispatch(self.cmd_buf.raw, groups[0], groups[1], groups[2])
+        };
+    }
+    fn dispatch_indirect(&mut self, indirect_buf: crate::BufferPiece) {
+        unsafe {
+            self.device.core.cmd_dispatch_indirect(
+                self.cmd_buf.raw,
+                indirect_buf.buffer.raw,
+                indirect_buf.offset,
+            )
+        };
+    }
+}
+
+#[hidden_trait::expose]
+impl crate::traits::RenderEncoder for super::PipelineEncoder<'_, '_> {
+    fn set_scissor_rect(&mut self, rect: &crate::ScissorRect) {
+        let vk_scissor = rect.to_vk();
+        unsafe {
+            self.device
+                .core
+                .cmd_set_scissor(self.cmd_buf.raw, 0, &[vk_scissor])
+        };
+    }
+
+    fn set_viewport(&mut self, viewport: &crate::Viewport) {
+        let vk_viewport = viewport.to_vk();
+        unsafe {
+            self.device
+                .core
+                .cmd_set_viewport(self.cmd_buf.raw, 0, &[vk_viewport])
+        };
+    }
+
+    fn set_stencil_reference(&mut self, reference: u32) {
+        unsafe {
+            self.device.core.cmd_set_stencil_reference(
+                self.cmd_buf.raw,
+                vk::StencilFaceFlags::FRONT_AND_BACK,
+                reference,
+            )
+        };
+    }
+}
+
+#[hidden_trait::expose]
+impl crate::traits::RenderPipelineEncoder for super::PipelineEncoder<'_, '_> {
+    type BufferPiece = crate::BufferPiece;
+
+    fn bind_vertex(&mut self, index: u32, vertex_buf: crate::BufferPiece) {
+        unsafe {
+            self.device.core.cmd_bind_vertex_buffers(
+                self.cmd_buf.raw,
+                index,
+                &[vertex_buf.buffer.raw],
+                &[vertex_buf.offset],
+            );
+        }
+    }
+
+    fn draw(
+        &mut self,
+        start_vertex: u32,
+        vertex_count: u32,
+        start_instance: u32,
+        instance_count: u32,
+    ) {
+        unsafe {
+            self.device.core.cmd_draw(
+                self.cmd_buf.raw,
+                vertex_count,
+                instance_count,
+                start_vertex,
+                start_instance,
+            );
+        }
+    }
+
+    fn draw_indexed(
+        &mut self,
+        index_buf: crate::BufferPiece,
+        index_type: crate::IndexType,
+        index_count: u32,
+        base_vertex: i32,
+        start_instance: u32,
+        instance_count: u32,
+    ) {
+        let raw_index_type = super::map_index_type(index_type);
+        unsafe {
+            self.device.core.cmd_bind_index_buffer(
+                self.cmd_buf.raw,
+                index_buf.buffer.raw,
+                index_buf.offset,
+                raw_index_type,
+            );
+            self.device.core.cmd_draw_indexed(
+                self.cmd_buf.raw,
+                index_count,
+                instance_count,
+                0,
+                base_vertex,
+                start_instance,
+            );
+        }
+    }
+
+    fn draw_indirect(&mut self, indirect_buf: crate::BufferPiece) {
+        unsafe {
+            self.device.core.cmd_draw_indirect(
+                self.cmd_buf.raw,
+                indirect_buf.buffer.raw,
+                indirect_buf.offset,
+                1,
+                0,
+            );
+        }
+    }
+
+    fn draw_indexed_indirect(
+        &mut self,
+        index_buf: crate::BufferPiece,
+        index_type: crate::IndexType,
+        indirect_buf: crate::BufferPiece,
+    ) {
+        let raw_index_type = super::map_index_type(index_type);
+        unsafe {
+            self.device.core.cmd_bind_index_buffer(
+                self.cmd_buf.raw,
+                index_buf.buffer.raw,
+                index_buf.offset,
+                raw_index_type,
+            );
+            self.device.core.cmd_draw_indexed_indirect(
+                self.cmd_buf.raw,
+                indirect_buf.buffer.raw,
+                indirect_buf.offset,
+                1,
+                0,
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ash::vk;
+    use std::time::{Duration, Instant};
+
+    use super::super::{CommandEncoder, PassKind, PassKinds, TimestampCalibration};
+
+    #[test]
+    fn acceleration_structure_array_uses_the_layout_count() {
+        use crate::ShaderBindable as _;
+        use ash::vk::Handle as _;
+        let mut words = [0u64; 2];
+        let mut context = super::super::PipelineContext {
+            update_data: bytemuck::cast_slice_mut(&mut words),
+            template_offsets: &[0],
+            array_counts: &[2],
+            scratch: None,
+            inline_uniform_mask: 0,
+        };
+        let mut array = crate::AccelerationStructureArray::<4>::new();
+        array.alloc(crate::AccelerationStructure {
+            raw: ash::vk::AccelerationStructureKHR::from_raw(7),
+            ..Default::default()
+        });
+        (&array).bind_to(&mut context, 0);
+        context.array_counts = &[0];
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                (&crate::BufferArray::<4>::new()).bind_to(&mut context, 0);
+            }))
+            .is_err()
+        );
+        assert_eq!(words, [7, 7]);
+    }
+
+    #[test]
+    fn binding_array_count_is_checked_before_writing() {
+        let mut words = [0u64; 4];
+        let mut context = super::super::PipelineContext {
+            update_data: bytemuck::cast_slice_mut(&mut words),
+            template_offsets: &[0, 16],
+            array_counts: &[2, 2],
+            scratch: None,
+            inline_uniform_mask: 0,
+        };
+        for count in [0, 1, 3] {
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    context.write_array(0, (0..count).map(|_| u64::MAX));
+                }))
+                .is_err()
+            );
+            assert!(context.update_data.iter().all(|&byte| byte == 0));
+        }
+        context.write_array(0, [1u64, 2].into_iter());
+        context.write_array(1, [3u64].into_iter().cycle().take(2));
+        assert_eq!(words, [1, 2, 3, 3]);
+    }
+
+    #[test]
+    fn calibrated_timestamp_mapping_handles_wrap_and_skew() {
+        let cpu = Instant::now();
+        let calibration = TimestampCalibration {
+            cpu,
+            gpu_ticks: 250,
+            period: 2.0,
+            valid_bits: 8,
+        };
+
+        assert_eq!(calibration.map(5), cpu + Duration::from_nanos(22));
+        let ten_ns_earlier = cpu.checked_sub(Duration::from_nanos(10)).unwrap();
+        assert_eq!(calibration.map(245), ten_ns_earlier);
+        let full_width = TimestampCalibration {
+            gpu_ticks: 5,
+            valid_bits: 64,
+            ..calibration
+        };
+        assert_eq!(full_width.map(0), ten_ns_earlier);
+    }
+
+    #[test]
+    fn producer_scope_unions_known_pass_kinds() {
+        let mut kinds = PassKinds::default();
+        kinds.insert(PassKind::Transfer);
+        kinds.insert(PassKind::Compute);
+
+        let (stages, accesses) = CommandEncoder::producer_scope(kinds);
+        assert_eq!(
+            stages,
+            vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::COMPUTE_SHADER
+        );
+        assert_eq!(
+            accesses,
+            vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::SHADER_WRITE
+        );
+    }
+
+    #[test]
+    fn unknown_producer_forces_the_conservative_source() {
+        let mut kinds = PassKinds::default();
+        kinds.insert(PassKind::Compute);
+        kinds.insert(PassKind::Unknown);
+
+        assert_eq!(
+            CommandEncoder::producer_scope(kinds),
+            (
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::AccessFlags::MEMORY_WRITE
+            )
+        );
+    }
+
+    #[test]
+    fn compute_consumer_includes_indirect_and_ray_query_reads() {
+        let (stages, accesses) = CommandEncoder::destination_scope(PassKind::Compute, true);
+        assert_eq!(
+            stages,
+            vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::DRAW_INDIRECT
+        );
+        assert!(accesses.contains(vk::AccessFlags::INDIRECT_COMMAND_READ));
+        assert!(accesses.contains(vk::AccessFlags::ACCELERATION_STRUCTURE_READ_KHR));
+        assert!(!accesses.intersects(
+            vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ
+        ));
+    }
+}

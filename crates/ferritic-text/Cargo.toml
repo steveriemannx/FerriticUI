@@ -1,0 +1,13 @@
+[package]
+name = "ferritic-text"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "System-font text engine and glyph atlas for FerriticUI (v0: unshaped Latin)"
+
+[dependencies]
+ferritic-core.workspace = true
+fontdb.workspace = true
+swash.workspace = true
+log.workspace = true

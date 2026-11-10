@@ -1,0 +1,21 @@
+[package]
+name = "blade-asset"
+version = "0.2.2"
+edition = "2024"
+rust-version = "1.92"
+description = "Asset manager for Blade"
+keywords = ["asset"]
+license = "MIT"
+repository = "https://github.com/kvark/blade"
+
+[lib]
+
+[dependencies]
+base64 = { workspace = true }
+bytemuck = { workspace = true }
+choir = { workspace = true }
+log = { workspace = true }
+profiling = { workspace = true }
+
+[package.metadata.cargo_check_external_types]
+allowed_external_types = ["choir::*"]

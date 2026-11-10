@@ -1,0 +1,130 @@
+[workspace]
+resolver = "2"
+members = [
+    "blade-asset",
+    "blade-engine",
+    "blade-egui",
+    "blade-graphics",
+    "blade-helpers",
+    "blade-macros",
+    "blade-particle",
+    "blade-render",
+    "blade-util",
+    "run-wasm",
+    "examples-android/xr",
+    "examples-android/asteroids",
+]
+exclude = []
+
+[workspace.dependencies]
+blade-graphics = { path = "blade-graphics", version = "0.9" }
+blade-util = { path = "blade-util", version = "0.5" }
+blade-egui = { path = "blade-egui", version = "0.9" }
+blade-particle = { path = "blade-particle", version = "0.2" }
+blade-macros = { path = "blade-macros", version = "0.3" }
+blade-helpers = { path = "blade-helpers", version = "0.3" }
+blade-asset = { path = "blade-asset", version = "0.2.2" }
+blade-render = { path = "blade-render", version = "0.6" }
+blade-engine = { path = "blade-engine", version = "0.2" }
+base64 = "0.22"
+bitflags = "2"
+bytemuck = { version = "1", features = ["derive"] }
+choir = "0.7"
+egui = "0.34"
+glam = { version = "0.33", features = ["mint"] }
+gltf = { version = "1.1", default-features = false }
+log = "0.4"
+mint = "0.5"
+# Metal publication fences and coherent buffer tables: kvark/wgpu#10.
+naga = { version = "30", git = "https://github.com/kvark/wgpu", rev = "9964733300924e724b6d41ef268e7c2933f3dcdb", features = ["wgsl-in", "termcolor"] }
+profiling = "1"
+slab = "0.4"
+strum = { version = "0.28", features = ["derive"] }
+web-sys = "0.3.60"
+# License policy: avoid Apache-2.0-only dependencies where possible.
+# `wayland-csd-adwaita` (winit default) pulls `sctk-adwaita` ->
+# `ab_glyph`/`owned_ttf_parser` (Apache-2.0), so it is left out. Consequence:
+# Wayland windows get no client-side decorations.
+winit = { version = "0.30", default-features = false, features = [
+    "rwh_06",
+    "x11",
+    "wayland",
+    "wayland-dlopen",
+] }
+openxr = "0.21"
+num_cpus = "1"
+
+[lib]
+
+[package]
+name = "blade"
+description = "Sharp and simple graphics library"
+version = "0.3.0"
+edition = "2024"
+rust-version = "1.92"
+keywords = ["graphics"]
+license = "MIT"
+repository = "https://github.com/kvark/blade"
+readme = "docs/README.md"
+
+[features]
+
+[dependencies]
+
+[dev-dependencies]
+blade-graphics.workspace = true
+blade-helpers.workspace = true
+blade-egui.workspace = true
+blade-asset.workspace = true
+blade-engine.workspace = true
+blade-particle.workspace = true
+blade-render.workspace = true
+blade-macros.workspace = true
+bytemuck = { workspace = true }
+choir = { workspace = true }
+egui = { workspace = true }
+egui-winit = { version = "0.34", default-features = false, features = [
+    "links",
+] }
+transform-gizmo-egui = "0.9"
+env_logger = "0.11"
+half = { version = "2", features = ["bytemuck"] }
+num_cpus = { workspace = true }
+glam = { workspace = true }
+log = { workspace = true }
+mint = { workspace = true, features = ["serde"] }
+naga = { workspace = true, features = ["glsl-out"] }
+nanorand = { version = "0.7", default-features = false, features = ["wyrand"] }
+png = "0.18"
+profiling = { workspace = true }
+ron = "0.12"
+serde = { version = "1", features = ["serde_derive"] }
+strum = { workspace = true }
+winit = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+console_error_panic_hook = "0.1.7"
+console_log = "1"
+web-sys = { workspace = true, features = ["Window"] }
+getrandom = { version = "0.2", features = ["js"] }
+
+[target.'cfg(any(target_os = "windows", target_os = "linux"))'.dev-dependencies]
+renderdoc = "0.12"
+
+# This is too slow in Debug
+[profile.dev.package.texpresso]
+opt-level = 3
+
+[package.metadata.cargo_check_external_types]
+#TODO: reconsider `egui`/`epaint` and `winit` here
+allowed_external_types = [
+    "egui::*",
+    "epaint::*",
+    "mint::*",
+    "profiling::*",
+    "serde::*",
+    "winit::*",
+]
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(gles)'] }
