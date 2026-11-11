@@ -1,0 +1,5 @@
+revision: 9964733300924e724b6d41ef268e7c2933f3dcdb
+repository: https://github.com/kvark/wgpu (kvark fork used by blade)
+crates: naga, naga-types
+changes: workspace-inherited package fields and dependencies inlined; dev-dependencies removed
+license: MIT OR Apache-2.0; see vendor/wgpu-naga/

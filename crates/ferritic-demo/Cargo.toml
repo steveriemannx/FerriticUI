@@ -1,0 +1,18 @@
+[package]
+name = "ferritic-demo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "FerriticUI counter demo for Redox (ferritic-orbital + ferritic-soft)"
+
+[[bin]]
+name = "ferritic-demo"
+path = "src/main.rs"
+
+[dependencies]
+ferritic-core.workspace = true
+ferritic-text.workspace = true
+ferritic-macros = { path = "../ferritic-macros" }
+ferritic-soft.workspace = true
+ferritic-orbital.workspace = true

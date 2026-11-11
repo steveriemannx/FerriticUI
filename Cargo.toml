@@ -8,6 +8,9 @@ members = [
     "crates/ferritic-winit",
     "crates/ferritic-macros",
     "crates/ferritic",
+    "crates/ferritic-soft",
+    "crates/ferritic-orbital",
+    "crates/ferritic-demo",
 ]
 
 [workspace.package]
@@ -21,6 +24,8 @@ ferritic-core = { path = "crates/ferritic-core" }
 ferritic-text = { path = "crates/ferritic-text" }
 ferritic-blade = { path = "crates/ferritic-blade" }
 ferritic-winit = { path = "crates/ferritic-winit" }
+ferritic-soft = { path = "crates/ferritic-soft" }
+ferritic-orbital = { path = "crates/ferritic-orbital" }
 
 # The blade main branch, copied into the workspace so that it is pinned and
 # stable while the upstream checkout switches branches.

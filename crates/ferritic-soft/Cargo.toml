@@ -1,0 +1,14 @@
+[package]
+name = "ferritic-soft"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Pure-Rust CPU rasterizer for FerriticUI scenes (Redox/Orbital path)"
+
+[dependencies]
+ferritic-core.workspace = true
+
+[dev-dependencies]
+ferritic-text.workspace = true
+ferritic-macros = { path = "../ferritic-macros" }

@@ -1,0 +1,13 @@
+[package]
+name = "ferritic-orbital"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Orbital (Redox) platform backend for FerriticUI, rendered by ferritic-soft"
+
+[dependencies]
+ferritic-core.workspace = true
+ferritic-text.workspace = true
+ferritic-soft.workspace = true
+orbclient = "0.4"

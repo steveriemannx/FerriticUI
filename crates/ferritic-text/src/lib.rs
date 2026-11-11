@@ -94,28 +94,80 @@ pub struct SystemText {
     scale: f32,
 }
 
+/// Picks the font family: preferred UI families first, then a generic
+/// sans-serif, then the first face that maps basic Latin glyphs. The last
+/// step matters on hosts whose font database starts with symbol or script
+/// faces that have digits but no letters.
+fn choose_face(database: &fontdb::Database) -> Option<(fontdb::ID, String)> {
+    const PREFERRED: &[&str] = &[
+        "Helvetica",
+        "Arial",
+        "SF Pro Text",
+        "Menlo",
+        "San Francisco",
+        "DejaVu Sans",
+        "Liberation Sans",
+        "Noto Sans",
+        "FreeSans",
+        "Ubuntu",
+        "Cantarell",
+    ];
+    for family in PREFERRED {
+        let query = fontdb::Query {
+            families: &[fontdb::Family::Name(family)],
+            ..Default::default()
+        };
+        if let Some(id) = database.query(&query) {
+            return Some((id, face_family(database, id, family)));
+        }
+    }
+    for family in [
+        fontdb::Family::SansSerif,
+        fontdb::Family::Monospace,
+        fontdb::Family::Serif,
+    ] {
+        let query = fontdb::Query {
+            families: &[family],
+            ..Default::default()
+        };
+        if let Some(id) = database.query(&query) {
+            return Some((id, face_family(database, id, "generic")));
+        }
+    }
+    for face in database.faces() {
+        let Some((data, index)) =
+            database.with_face_data(face.id, |data, index| (data.to_vec(), index as usize))
+        else {
+            continue;
+        };
+        let Some(font) = swash::FontRef::from_index(&data, index) else {
+            continue;
+        };
+        let charmap = font.charmap();
+        if ['R', 'e', 's', 't', '0']
+            .iter()
+            .all(|character| charmap.map(*character) != 0)
+        {
+            return Some((face.id, face_family(database, face.id, "unknown")));
+        }
+    }
+    None
+}
+
+fn face_family(database: &fontdb::Database, id: fontdb::ID, fallback: &str) -> String {
+    database
+        .face(id)
+        .and_then(|face| face.families.first().map(|(name, _)| name.clone()))
+        .unwrap_or_else(|| fallback.to_string())
+}
+
 impl SystemText {
     pub fn new() -> Result<Self, String> {
         let mut database = fontdb::Database::new();
         database.load_system_fonts();
 
-        let mut chosen: Option<fontdb::ID> = None;
-        let mut chosen_name = String::new();
-        for family in ["Helvetica", "Arial", "SF Pro Text", "Menlo", "San Francisco"] {
-            let query = fontdb::Query {
-                families: &[fontdb::Family::Name(family)],
-                ..Default::default()
-            };
-            if let Some(id) = database.query(&query) {
-                chosen = Some(id);
-                chosen_name = family.to_string();
-                break;
-            }
-        }
-        let id = chosen
-            .or_else(|| database.faces().next().map(|face| face.id))
-            .ok_or_else(|| "no system font found".to_string())?;
-
+        let (id, font_name) =
+            choose_face(&database).ok_or_else(|| "no system font found".to_string())?;
         let (font_data, face_index) = database
             .with_face_data(id, |data, index| (data.to_vec(), index as usize))
             .ok_or_else(|| "system font has no readable data".to_string())?;
@@ -127,7 +179,7 @@ impl SystemText {
             glyphs: HashMap::new(),
             metrics: HashMap::new(),
             atlas: Atlas::new(),
-            font_name: chosen_name,
+            font_name,
             scale: 1.0,
         })
     }

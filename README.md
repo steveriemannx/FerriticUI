@@ -6,6 +6,8 @@
 > (DPI 感知)、Label/Button/Checkbox/TextInput/Slider/List/Panel/Center/Scroll、scissor 裁剪与
 > 滚轮、文本编辑(光标/选区/剪贴板/IME 预编辑)、虚拟化列表、命中/消息/Tab 焦点/滚动/编辑测试、
 > 离屏快照 golden 回归(逐字节 + SSIM 容差)。
+> **Redox 路径**:`ferritic-soft`(纯 CPU 光栅化)+ `ferritic-orbital`(orbclient 窗口),
+> `ferritic-demo` 可在主机(orbclient 的 SDL2 后端)开窗运行。
 
 | Counter | 交互状态 | Settings gallery |
 |---|---|---|
@@ -34,6 +36,15 @@
 
 # 冒烟:开窗,渲染若干帧后自动退出(用于 CI/无人值守)
 FERRITIC_EXIT_AFTER_MS=1200 ./scripts/cargo.sh run -p ferritic --example counter
+
+# 无 GPU:用 ferritic-soft(纯 CPU)渲染同一 counter 场景,写出 PPM 到临时目录
+cargo run -p ferritic-soft --example counter_snapshot
+
+# Redox 栈:ferritic-orbital 窗口 + ferritic-soft 渲染(主机上 orbclient 走 SDL2)
+cargo run -p ferritic-demo
+
+# 不开窗口:上面的 demo 直接输出 PPM 快照
+cargo run -p ferritic-demo -- --snapshot
 ```
 
 首次构建会编译 vendored 的 blade + naga(约 20-60s)。工具链 Rust 1.93,macOS arm64 已验证。
@@ -42,7 +53,7 @@ FERRITIC_EXIT_AFTER_MS=1200 ./scripts/cargo.sh run -p ferritic --example counter
 
 已实现(全部通过 `cargo check/build` 与测试):
 
-- **工作区**:vendor 的 `blade-ferritic` 集成分支(基于 main `30c94eb` + D3D12 后端 + MIT 依赖策略,rev `4c7b695`;可离线构建的 `.cargo-home`),crates:`ferritic-core` / `ferritic-text` / `ferritic-blade` / `ferritic-winit` / `ferritic-macros` / `ferritic`。
+- **工作区**:vendor 的 `blade-ferritic` 集成分支(基于 main `30c94eb` + D3D12 后端 + MIT 依赖策略,rev `4c7b695`);blade 依赖的 `naga`/`naga-types` fork(`kvark/wgpu` rev `9964733`)也 vendored 在 `vendor/wgpu-naga`(内联 workspace 字段),`Cargo.lock` 中已无 git 依赖。crates:`ferritic-core` / `ferritic-text` / `ferritic-blade` / `ferritic-soft` / `ferritic-orbital` / `ferritic-winit` / `ferritic-macros` / `ferritic` / `ferritic-demo`。
 - **静态模型**:`ui!` 生成扁平 `struct`(字段即节点)、私有 `enum Node`、编译期子节点/焦点表、每个 pass 的静态 `match`;`App::update` 唯一根消息;无运行时树、无 diff、无反射。
 - **布局**:Column / Row / Center / Panel / Scroll(无限高度测量、滚动 + clamp、滚动条);子节点 clamp 与 child constraints。
 - **事件**:命中测试、hover/pressed、点击聚焦、Tab 焦点顺序、滚轮(叶子优先 + Scroll 冒泡)、TextInput 编辑键、Ctrl 修饰键。
@@ -50,16 +61,22 @@ FERRITIC_EXIT_AFTER_MS=1200 ./scripts/cargo.sh run -p ferritic --example counter
 - **文本编辑**:光标/选区/横向滚动、Home/End/方向键/Shift 扩选、Ctrl+A/C/X/V 剪贴板、IME 预编辑/提交、焦点同步 `set_ime_allowed`/`set_ime_cursor_area`。
 - **控件**:Label、Button(hover/pressed/disabled/文本对齐)、Checkbox、TextInput、Slider(拖拽/键盘)、List(1000 行虚拟化)、Panel(背景/边框/阴影)、Center、Scroll。
 - **验证**:11 个交互测试(headless,无需 GPU)+ 9 张离屏快照 golden(`scripts/check.sh`,逐字节或 SSIM ≥ 0.95);6 个示例窗口冒烟可运行。
+- **软渲染(Redox 路径)**:`ferritic-soft`,纯 Rust CPU 光栅化器,规则与 blade 着色器一致(SDF 圆角/边框、软阴影、A8 字形线性采样、相同 scissor 与混合因子);同机同字体下与 blade GPU 渲染逐像素对比 **SSIM 0.9996**(平均通道误差 0.04)。
+- **Orbital 平台(Redox 路径)**:`ferritic-orbital`,orbclient 窗口和事件循环,把 `ferritic-soft` 的 RGBA8 直接写入窗口缓冲;键/鼠标/滚轮/焦点/缩放/剪贴板映射与 winit 层一致。`ferritic-demo` 在主机上经 orbclient 的 SDL2 后端运行,并已在 redox 仓库的 `recipes/gui/ferriticui` + `CONFIG_NAME=ferriticui` 镜像中启动成功:Orbital 窗口正常显示,点击 `+` 计数从 0 变为 1;recipe 还会安装 Orbital launcher 条目(`/usr/share/ui/apps/65_ferriticui`)。
 
-暂未实现(后续方向):多行 `TextArea`、图标/菜单/弹窗/Tooltip、Tabs/ProgressBar/滚动条拖拽、Windows/Linux 平台验证、无障碍(accesskit)、多窗口与设计器代码生成。
+暂未实现(后续方向):desktop launcher/`.desktop` 集成、多行 `TextArea`、图标/菜单/弹窗/Tooltip、Tabs/ProgressBar/滚动条拖拽、无障碍(accesskit)、多窗口与设计器代码生成。
 
 ## 结构
 
 ```text
 vendor/blade-ferritic/    自建集成分支:D3D12 后端 + MIT 依赖策略(rev 4c7b695,见 vendor/blade-ferritic.rev)
+vendor/wgpu-naga/         blade 使用的 naga + naga-types fork(rev 9964733,见 vendor/wgpu-naga.rev)
 crates/ferritic-core/     几何/主题/布局/Scene/事件/App·StaticUi,以及全部内置控件
 crates/ferritic-text/     系统字体 + swash → A8 字形图集(DPI 感知;整形引擎暂未接入)
 crates/ferritic-blade/    blade 渲染器:SDF 圆角/边框/软阴影、字形图集、批次+scissor、swap chain/离屏快照
+crates/ferritic-soft/     纯 Rust CPU 光栅化器:同一场景 → RGBA8(Redox/Orbital 路径,无 GPU 依赖)
+crates/ferritic-orbital/  orbclient 平台层:Orbital 窗口/事件循环 + 软渲染显示
+crates/ferritic-demo/     Redox 演示程序:counter 窗口 + `--snapshot` 无显示模式
 crates/ferritic-winit/    winit 0.30 平台层:窗口/输入/DPI/IME/焦点/剪贴板、事件驱动重绘(空闲零帧)
 crates/ferritic-macros/   ui! 过程宏:扁平 struct + Node 枚举 + 每个 pass 的静态分派
 crates/ferritic/          facade 与 examples(counter / counter_manual / widgets / scroll / form / list)
