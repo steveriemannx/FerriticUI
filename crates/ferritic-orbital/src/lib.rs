@@ -80,15 +80,31 @@ fn run_inner<A: App>(
         orbclient::get_display_size().unwrap_or((options.width, options.height));
     let x = display_width.saturating_sub(options.width) as i32 / 2;
     let y = display_height.saturating_sub(options.height) as i32 / 2;
-    let window = Window::new_flags(
-        x,
-        y,
-        options.width,
-        options.height,
-        &options.title,
-        WindowFlags::new(&flags),
-    )
-    .ok_or_else(|| "unable to open an Orbital window".to_string())?;
+
+    // Autostarted apps can beat the Orbital display server; retry when asked.
+    let retry_deadline = std::env::var("FERRITIC_WINDOW_RETRY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .map(|retry| Instant::now() + retry);
+    let window = loop {
+        if let Some(window) = Window::new_flags(
+            x,
+            y,
+            options.width,
+            options.height,
+            &options.title,
+            WindowFlags::new(&flags),
+        ) {
+            break window;
+        }
+        match retry_deadline {
+            Some(deadline) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            _ => return Err("unable to open an Orbital window".to_string()),
+        }
+    };
 
     let mut text = match text {
         Some(text) => text,
