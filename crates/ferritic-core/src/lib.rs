@@ -1208,6 +1208,11 @@ pub trait App: Sized + 'static {
     fn update(&mut self, msg: Self::Msg, cx: &mut Ctx);
     fn view(&self) -> &Self::Ui;
     fn view_mut(&mut self) -> &mut Self::Ui;
+
+    /// Periodic callback for apps that poll external sources (a PTY, a socket,
+    /// an animation clock). Platform backends with a polling loop call this
+    /// once per iteration; backends with a blocking event loop never do.
+    fn tick(&mut self, _cx: &mut Ctx) {}
 }
 
 /// The handle an application gets in `update`: it can request a redraw or

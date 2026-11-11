@@ -11,6 +11,7 @@ members = [
     "crates/ferritic-soft",
     "crates/ferritic-orbital",
     "crates/ferritic-demo",
+    "crates/ferritic-term",
 ]
 
 [workspace.package]

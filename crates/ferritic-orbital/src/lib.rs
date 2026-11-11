@@ -23,15 +23,56 @@ use orbclient::{EventOption, KeyEvent, MediaKind, Renderer, Window, WindowFlag, 
 
 /// Runs an application in an Orbital window until it closes.
 pub fn run<A: App>(app: A, options: WindowOptions) -> Result<(), String> {
+    run_inner(app, options, None, None)
+}
+
+/// Like [`run`], but with a caller-provided text engine (for monospace
+/// terminals or a custom font).
+pub fn run_with_text<A: App>(
+    app: A,
+    options: WindowOptions,
+    text: SystemText,
+) -> Result<(), String> {
+    run_inner(app, options, None, Some(text))
+}
+
+/// Runs an application with a non-blocking event loop that calls
+/// [`App::tick`] every `interval`. Use this for apps that poll external
+/// sources (a PTY, a socket) or animate.
+pub fn run_polling<A: App>(
+    app: A,
+    options: WindowOptions,
+    interval: Duration,
+) -> Result<(), String> {
+    run_inner(app, options, Some(interval), None)
+}
+
+/// Like [`run_polling`], but with a caller-provided text engine.
+pub fn run_polling_with_text<A: App>(
+    app: A,
+    options: WindowOptions,
+    interval: Duration,
+    text: SystemText,
+) -> Result<(), String> {
+    run_inner(app, options, Some(interval), Some(text))
+}
+
+fn run_inner<A: App>(
+    app: A,
+    options: WindowOptions,
+    poll: Option<Duration>,
+    text: Option<SystemText>,
+) -> Result<(), String> {
     let exit_after = std::env::var("FERRITIC_EXIT_AFTER_MS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .map(Duration::from_millis);
 
-    // Async windows poll instead of blocking, so the smoke-test timer can
-    // interrupt an idle event loop.
+    // Async windows poll instead of blocking, so the smoke-test timer and
+    // tick-based apps can run an idle event loop.
+    let nonblocking = exit_after.is_some() || poll.is_some();
     let mut flags = vec![WindowFlag::Resizable];
-    if exit_after.is_some() {
+    if nonblocking {
         flags.push(WindowFlag::Async);
     }
 
@@ -49,7 +90,10 @@ pub fn run<A: App>(app: A, options: WindowOptions) -> Result<(), String> {
     )
     .ok_or_else(|| "unable to open an Orbital window".to_string())?;
 
-    let mut text = SystemText::new()?;
+    let mut text = match text {
+        Some(text) => text,
+        None => SystemText::new()?,
+    };
     text.set_scale(1.0);
 
     let mut platform = Platform {
@@ -72,7 +116,7 @@ pub fn run<A: App>(app: A, options: WindowOptions) -> Result<(), String> {
     platform.app.view_mut().apply_theme(&platform.theme);
     platform.render();
 
-    let polling = exit_after.is_some();
+    let interval = poll.unwrap_or_else(|| Duration::from_millis(8));
     while !platform.should_exit {
         if let Some(deadline) = platform.exit_after {
             if Instant::now() >= deadline {
@@ -81,8 +125,8 @@ pub fn run<A: App>(app: A, options: WindowOptions) -> Result<(), String> {
         }
         let events: Vec<orbclient::Event> = platform.window.events().collect();
         if events.is_empty() {
-            if polling {
-                std::thread::sleep(Duration::from_millis(8));
+            if nonblocking {
+                std::thread::sleep(interval);
             } else {
                 // A blocking window that reports no events has lost its
                 // connection to the display server.
@@ -93,6 +137,16 @@ pub fn run<A: App>(app: A, options: WindowOptions) -> Result<(), String> {
             platform.handle(raw);
             if platform.should_exit {
                 break;
+            }
+        }
+        if poll.is_some() {
+            let mut ctx = Ctx::default();
+            platform.app.tick(&mut ctx);
+            if ctx.needs_redraw {
+                platform.dirty = true;
+            }
+            if ctx.close_requested {
+                platform.should_exit = true;
             }
         }
         if platform.dirty && !platform.should_exit {

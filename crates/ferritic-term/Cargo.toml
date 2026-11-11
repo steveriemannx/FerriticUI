@@ -1,0 +1,18 @@
+[package]
+name = "ferritic-term"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "FerriticUI terminal: ransid emulation, a PTY shell and soft rendering on Orbital"
+
+[[bin]]
+name = "ferritic-term"
+path = "src/main.rs"
+
+[dependencies]
+ferritic-core.workspace = true
+ferritic-text.workspace = true
+ferritic-orbital.workspace = true
+ransid = "0.5"
+libc = "0.2"

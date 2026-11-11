@@ -94,25 +94,42 @@ pub struct SystemText {
     scale: f32,
 }
 
-/// Picks the font family: preferred UI families first, then a generic
-/// sans-serif, then the first face that maps basic Latin glyphs. The last
-/// step matters on hosts whose font database starts with symbol or script
-/// faces that have digits but no letters.
-fn choose_face(database: &fontdb::Database) -> Option<(fontdb::ID, String)> {
-    const PREFERRED: &[&str] = &[
-        "Helvetica",
-        "Arial",
-        "SF Pro Text",
-        "Menlo",
-        "San Francisco",
-        "DejaVu Sans",
-        "Liberation Sans",
-        "Noto Sans",
-        "FreeSans",
-        "Ubuntu",
-        "Cantarell",
-    ];
-    for family in PREFERRED {
+const PREFERRED_FAMILIES: &[&str] = &[
+    "Helvetica",
+    "Arial",
+    "SF Pro Text",
+    "Menlo",
+    "San Francisco",
+    "DejaVu Sans",
+    "Liberation Sans",
+    "Noto Sans",
+    "FreeSans",
+    "Ubuntu",
+    "Cantarell",
+];
+
+const MONOSPACE_FAMILIES: &[&str] = &[
+    "DejaVu Sans Mono",
+    "Liberation Mono",
+    "Noto Sans Mono",
+    "Menlo",
+    "Consolas",
+    "Ubuntu Mono",
+    "Hack",
+    "Fira Mono",
+    "FreeMono",
+];
+
+/// Picks a font family: the preferred names first, then the generic
+/// families, then the first face that maps basic Latin glyphs. The last step
+/// matters on hosts whose font database starts with symbol or script faces
+/// that have digits but no letters.
+fn choose_face(
+    database: &fontdb::Database,
+    preferred: &[&str],
+    generic: &[fontdb::Family<'_>],
+) -> Option<(fontdb::ID, String)> {
+    for family in preferred {
         let query = fontdb::Query {
             families: &[fontdb::Family::Name(family)],
             ..Default::default()
@@ -121,13 +138,9 @@ fn choose_face(database: &fontdb::Database) -> Option<(fontdb::ID, String)> {
             return Some((id, face_family(database, id, family)));
         }
     }
-    for family in [
-        fontdb::Family::SansSerif,
-        fontdb::Family::Monospace,
-        fontdb::Family::Serif,
-    ] {
+    for family in generic {
         let query = fontdb::Query {
-            families: &[family],
+            families: &[family.clone()],
             ..Default::default()
         };
         if let Some(id) = database.query(&query) {
@@ -163,11 +176,38 @@ fn face_family(database: &fontdb::Database, id: fontdb::ID, fallback: &str) -> S
 
 impl SystemText {
     pub fn new() -> Result<Self, String> {
+        Self::new_with_families(
+            PREFERRED_FAMILIES,
+            &[
+                fontdb::Family::SansSerif,
+                fontdb::Family::Monospace,
+                fontdb::Family::Serif,
+            ],
+        )
+    }
+
+    /// A text engine that prefers a monospace face, for terminals and code
+    /// editors.
+    pub fn new_monospace() -> Result<Self, String> {
+        Self::new_with_families(
+            MONOSPACE_FAMILIES,
+            &[
+                fontdb::Family::Monospace,
+                fontdb::Family::SansSerif,
+                fontdb::Family::Serif,
+            ],
+        )
+    }
+
+    fn new_with_families(
+        preferred: &[&str],
+        generic: &[fontdb::Family<'_>],
+    ) -> Result<Self, String> {
         let mut database = fontdb::Database::new();
         database.load_system_fonts();
 
-        let (id, font_name) =
-            choose_face(&database).ok_or_else(|| "no system font found".to_string())?;
+        let (id, font_name) = choose_face(&database, preferred, generic)
+            .ok_or_else(|| "no system font found".to_string())?;
         let (font_data, face_index) = database
             .with_face_data(id, |data, index| (data.to_vec(), index as usize))
             .ok_or_else(|| "system font has no readable data".to_string())?;
