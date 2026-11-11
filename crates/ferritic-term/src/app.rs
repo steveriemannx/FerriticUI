@@ -9,11 +9,28 @@ use crate::terminal::{Msg, TerminalUi};
 pub struct TermApp {
     session: Session,
     ui: TerminalUi,
+    /// The shell or PTY is gone; keep the window and its last screen visible
+    /// instead of making the window disappear under the user.
+    exited: bool,
 }
 
 impl TermApp {
     pub fn new(session: Session, ui: TerminalUi) -> Self {
-        Self { session, ui }
+        Self {
+            session,
+            ui,
+            exited: false,
+        }
+    }
+
+    fn finish(&mut self, cx: &mut Ctx, reason: &str) {
+        if self.exited {
+            return;
+        }
+        self.exited = true;
+        let message = format!("\r\n[{reason}; close the window]\r\n");
+        self.ui.write(message.as_bytes());
+        cx.request_redraw();
     }
 }
 
@@ -22,6 +39,9 @@ impl App for TermApp {
     type Ui = TerminalUi;
 
     fn update(&mut self, msg: Msg, _cx: &mut Ctx) {
+        if self.exited {
+            return;
+        }
         match msg {
             Msg::Input(bytes) => {
                 let _ = self.session.write(&bytes);
@@ -38,10 +58,14 @@ impl App for TermApp {
     }
 
     fn tick(&mut self, cx: &mut Ctx) {
+        if self.exited {
+            return;
+        }
+
         let mut output = Vec::new();
         if let Err(error) = self.session.read(&mut output) {
             eprintln!("ferritic-term: pty read failed: {error}");
-            cx.request_close();
+            self.finish(cx, "pty read failed");
             return;
         }
         if !output.is_empty() {
@@ -60,7 +84,7 @@ impl App for TermApp {
         }
 
         if self.session.closed() || self.session.exited() {
-            cx.request_close();
+            self.finish(cx, "shell exited");
         }
     }
 }

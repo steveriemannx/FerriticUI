@@ -203,6 +203,11 @@ impl<A: App> Platform<A> {
                 let event = if focus.focused {
                     Event::FocusGained
                 } else {
+                    // Key releases go to the newly focused window, so drop any
+                    // modifier state to avoid a stuck ctrl/shift after refocus.
+                    self.shift = false;
+                    self.ctrl = false;
+                    self.buttons = (false, false, false);
                     Event::FocusLost
                 };
                 self.dispatch(event);
