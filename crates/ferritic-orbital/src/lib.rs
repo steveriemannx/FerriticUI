@@ -1,9 +1,12 @@
-//! The Orbital platform layer for Redox: an `orbclient` window, the
-//! `ferritic-soft` CPU renderer and an event-driven loop.
+//! The Orbital platform layer for Redox: an `orbclient` window, an RGBA8
+//! renderer and an event-driven loop.
 //!
-//! Orbital has no GPU API, so unlike [`ferritic_winit`] this backend never
-//! touches blade. The scene is rasterized into an RGBA8 buffer and copied into
-//! the orbclient window buffer, which is then synced to the display server.
+//! By default the scene is rasterized by the `ferritic-soft` CPU renderer and
+//! copied into the orbclient window buffer. With the `blade` feature and
+//! `FERRITIC_RENDERER=blade`, the same scene is rendered through the
+//! `ferritic-blade` Vulkan backend instead (Mesa/lavapipe on Redox, where there
+//! is no Vulkan window system: rendering is offscreen and the pixels are
+//! copied into the window). The CPU path stays available as the fallback.
 //!
 //! The event mapping mirrors the winit layer: pointer moves/buttons/scroll,
 //! keys with shift/ctrl state, text input, focus and clipboard.
@@ -14,8 +17,8 @@
 use std::time::{Duration, Instant};
 
 use ferritic_core::{
-    App, Constraints, Ctx, Cursor, Event, EventCtx, Key, Point, PointerButton, Prim, Rect, Scene,
-    Size, StaticUi, TextEngine, WindowOptions,
+    App, AtlasUpdate, Constraints, Ctx, Cursor, Event, EventCtx, Key, Point, PointerButton, Prim,
+    Rect, Scene, Size, StaticUi, TextEngine, WindowOptions,
 };
 use ferritic_soft::SoftRenderer;
 use ferritic_text::SystemText;
@@ -117,7 +120,7 @@ fn run_inner<A: App>(
         theme: options.theme,
         window,
         text,
-        renderer: SoftRenderer::new(),
+        backend: Backend::create(),
         scene: Scene::default(),
         event_cx: EventCtx::default(),
         size: Size::ZERO,
@@ -128,6 +131,8 @@ fn run_inner<A: App>(
         buttons: (false, false, false),
         should_exit: false,
         exit_after: exit_after.map(|delay| Instant::now() + delay),
+        dump_path: std::env::var_os("FERRITIC_DUMP_PPM").map(std::path::PathBuf::from),
+        dumped: false,
     };
     platform.app.view_mut().apply_theme(&platform.theme);
     platform.render();
@@ -172,12 +177,69 @@ fn run_inner<A: App>(
     Ok(())
 }
 
+/// The pixel source behind an Orbital window.
+///
+/// Both backends produce an RGBA8 buffer of the window's physical size; only
+/// the rasterizer differs. `Blade` renders offscreen through Vulkan and reads
+/// the pixels back, which is the only available shape on Redox (Orbital has no
+/// GPU surface protocol).
+enum Backend {
+    Soft(SoftRenderer),
+    #[cfg(feature = "blade")]
+    Blade(Box<ferritic_blade::Gpu>),
+}
+
+impl Backend {
+    fn create() -> Self {
+        #[cfg(feature = "blade")]
+        {
+            let requested = std::env::var("FERRITIC_RENDERER")
+                .is_ok_and(|value| value.eq_ignore_ascii_case("blade") || value.eq_ignore_ascii_case("gpu"));
+            if requested {
+                match ferritic_blade::Gpu::new_offscreen() {
+                    Ok(gpu) => {
+                        eprintln!("ferritic-orbital: rendering through ferritic-blade (Vulkan)");
+                        return Self::Blade(Box::new(gpu));
+                    }
+                    Err(error) => eprintln!(
+                        "ferritic-orbital: ferritic-blade unavailable ({error}); falling back to ferritic-soft"
+                    ),
+                }
+            }
+        }
+        Self::Soft(SoftRenderer::new())
+    }
+
+    fn render(
+        &mut self,
+        size: Size,
+        width: u32,
+        height: u32,
+        scale: f32,
+        scene: &Scene,
+        atlas: Option<&AtlasUpdate>,
+    ) -> Result<Vec<u8>, String> {
+        #[cfg(not(feature = "blade"))]
+        let _ = size;
+        match self {
+            Self::Soft(renderer) => {
+                renderer.resize(width, height, scale);
+                Ok(renderer.render(scene, atlas).to_vec())
+            }
+            #[cfg(feature = "blade")]
+            Self::Blade(gpu) => gpu
+                .render_offscreen(size, scale, scene, atlas)
+                .map(|snapshot| snapshot.pixels),
+        }
+    }
+}
+
 struct Platform<A: App> {
     app: A,
     theme: ferritic_core::Theme,
     window: Window,
     text: SystemText,
-    renderer: SoftRenderer,
+    backend: Backend,
     scene: Scene,
     event_cx: EventCtx,
     size: Size,
@@ -190,6 +252,9 @@ struct Platform<A: App> {
     buttons: (bool, bool, bool),
     should_exit: bool,
     exit_after: Option<Instant>,
+    /// When set, the first presented frame is written as a PPM for tests.
+    dump_path: Option<std::path::PathBuf>,
+    dumped: bool,
 }
 
 impl<A: App> Platform<A> {
@@ -344,8 +409,34 @@ impl<A: App> Platform<A> {
         }
 
         let atlas = self.text.atlas_update();
-        self.renderer.resize(width, height, self.scale);
-        let pixels = self.renderer.render(&scene, atlas.as_ref());
+        let pixels = match self.backend.render(size, width, height, self.scale, &scene, atlas.as_ref()) {
+            Ok(pixels) => pixels,
+            Err(error) => {
+                eprintln!(
+                    "ferritic-orbital: blade frame failed ({error}); continuing with ferritic-soft"
+                );
+                self.backend = Backend::Soft(SoftRenderer::new());
+                self.backend
+                    .render(size, width, height, self.scale, &scene, atlas.as_ref())
+                    .unwrap_or_else(|error| {
+                        eprintln!("ferritic-orbital: ferritic-soft frame failed ({error})");
+                        Vec::new()
+                    })
+            }
+        };
+        if !self.dumped {
+            if let Some(path) = self.dump_path.as_deref() {
+                match write_ppm(path, width, height, &pixels) {
+                    Ok(()) => {
+                        eprintln!("ferritic-orbital: wrote first frame to {}", path.display())
+                    }
+                    Err(error) => {
+                        eprintln!("ferritic-orbital: cannot write {}: {error}", path.display())
+                    }
+                }
+                self.dumped = true;
+            }
+        }
         let data = self.window.data_mut();
         for (pixel, color) in pixels.chunks_exact(4).zip(data.iter_mut()) {
             color.data = ((pixel[3] as u32) << 24)
@@ -379,4 +470,19 @@ fn translate_key(scancode: u8) -> Key {
         orbclient::K_PGDN => Key::PageDown,
         _ => Key::Other,
     }
+}
+
+fn write_ppm(
+    path: &std::path::Path,
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+) -> Result<(), String> {
+    let header = format!("P6\n{width} {height}\n255\n");
+    let mut out = Vec::with_capacity(header.len() + rgba.len() / 4 * 3);
+    out.extend_from_slice(header.as_bytes());
+    for pixel in rgba.chunks_exact(4) {
+        out.extend_from_slice(&pixel[..3]);
+    }
+    std::fs::write(path, out).map_err(|error| error.to_string())
 }

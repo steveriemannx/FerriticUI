@@ -191,6 +191,8 @@ pub struct Gpu {
     pub context: blade::Context,
     encoder: blade::CommandEncoder,
     previous_sync: Option<blade::SyncPoint>,
+    /// Lazily created state of the offscreen (window-less) render path.
+    offscreen: Option<Offscreen>,
 }
 
 impl Gpu {
@@ -222,6 +224,7 @@ impl Gpu {
             context,
             encoder,
             previous_sync: None,
+            offscreen: None,
         })
     }
 
@@ -480,6 +483,7 @@ impl WindowSurface {
             context,
             encoder,
             previous_sync,
+            ..
         } = gpu;
 
         encoder.start();
@@ -557,7 +561,236 @@ pub struct Snapshot {
     pub pixels: Vec<u8>,
 }
 
+/// The persistent resources of the offscreen path.
+///
+/// Creating pipelines, the glyph atlas and the readback target costs far more
+/// than a frame, so [`Gpu::render_offscreen`] keeps them alive across calls.
+/// Without this, presenting every frame through a CPU-visible Vulkan device
+/// (Mesa/lavapipe on Redox) would rebuild the whole pipeline stack each frame.
+struct Offscreen {
+    texture: blade::Texture,
+    view: blade::TextureView,
+    readback: blade::Buffer,
+    extent: blade::Extent,
+    byte_count: u64,
+    /// The colour target still needs its one-time layout transition.
+    target_initialized: bool,
+    pipelines: Pipelines,
+    atlas: AtlasTexture,
+    belt: BufferBelt,
+}
+
+impl Offscreen {
+    fn new(context: &blade::Context, extent: blade::Extent) -> Self {
+        let format = blade::TextureFormat::Rgba8Unorm;
+        let (texture, view, readback) = Self::create_target(context, extent, format);
+        Self {
+            texture,
+            view,
+            readback,
+            extent,
+            byte_count: (extent.width * extent.height * 4) as u64,
+            target_initialized: false,
+            pipelines: Pipelines::new(context, format),
+            atlas: AtlasTexture::new(context),
+            belt: new_belt(),
+        }
+    }
+
+    fn create_target(
+        context: &blade::Context,
+        extent: blade::Extent,
+        format: blade::TextureFormat,
+    ) -> (blade::Texture, blade::TextureView, blade::Buffer) {
+        let texture = context.create_texture(blade::TextureDesc {
+            name: "ferritic_snapshot_target",
+            format,
+            size: extent,
+            array_layer_count: 1,
+            mip_level_count: 1,
+            dimension: blade::TextureDimension::D2,
+            usage: blade::TextureUsage::TARGET | blade::TextureUsage::COPY,
+            sample_count: 1,
+            external: None,
+        });
+        let view = context.create_texture_view(
+            texture,
+            blade::TextureViewDesc {
+                name: "ferritic_snapshot_view",
+                format,
+                dimension: blade::ViewDimension::D2,
+                subresources: &blade::TextureSubresources::default(),
+            },
+        );
+        let byte_count = (extent.width * extent.height * 4) as u64;
+        let readback = context.create_buffer(blade::BufferDesc {
+            name: "ferritic_snapshot_readback",
+            size: byte_count,
+            memory: blade::Memory::Shared,
+        });
+        (texture, view, readback)
+    }
+
+    /// Replaces the colour target when the window is resized. Pipelines and
+    /// the glyph atlas are bound to the format, not the size, so they survive.
+    fn resize(&mut self, context: &blade::Context, extent: blade::Extent) {
+        context.destroy_buffer(self.readback);
+        context.destroy_texture_view(self.view);
+        context.destroy_texture(self.texture);
+        let format = blade::TextureFormat::Rgba8Unorm;
+        let (texture, view, readback) = Self::create_target(context, extent, format);
+        self.texture = texture;
+        self.view = view;
+        self.readback = readback;
+        self.extent = extent;
+        self.byte_count = (extent.width * extent.height * 4) as u64;
+        self.target_initialized = false;
+    }
+
+    fn destroy(&mut self, context: &blade::Context) {
+        self.belt.destroy(context);
+        self.pipelines.destroy(context);
+        self.atlas.destroy(context);
+        context.destroy_buffer(self.readback);
+        context.destroy_texture_view(self.view);
+        context.destroy_texture(self.texture);
+    }
+}
+
+impl Gpu {
+    /// Renders a scene into the persistent offscreen target and reads it back.
+    ///
+    /// This is the path used on platforms without a Vulkan window system
+    /// (Redox with Mesa/lavapipe): the caller owns the window buffer and copies
+    /// these pixels into it. Pipelines, the atlas texture and the readback
+    /// buffer are reused across frames and only the colour target is recreated
+    /// on resize.
+    pub fn render_offscreen(
+        &mut self,
+        logical_size: Size,
+        scale: f32,
+        scene: &Scene,
+        atlas: Option<&AtlasUpdate>,
+    ) -> Result<Snapshot, String> {
+        let physical = Size::new(logical_size.width * scale, logical_size.height * scale);
+        let physical_extent = extent(physical);
+
+        let Gpu {
+            context,
+            encoder,
+            previous_sync,
+            offscreen,
+        } = self;
+        let _ = previous_sync.take();
+
+        if offscreen.is_none() {
+            *offscreen = Some(Offscreen::new(context, physical_extent));
+        }
+        let state = offscreen.as_mut().unwrap();
+        if state.extent != physical_extent {
+            state.resize(context, physical_extent);
+        }
+
+        encoder.start();
+        if !state.target_initialized {
+            encoder.init_texture(state.texture);
+            state.target_initialized = true;
+        }
+        if !state.atlas.initialized {
+            encoder.init_texture(state.atlas.texture);
+            state.atlas.initialized = true;
+        }
+
+        if let Some(update) = atlas {
+            if state.atlas.version != update.version {
+                state.atlas.version = update.version;
+                let source = state.belt.alloc_bytes(&update.pixels, context);
+                let mut transfer = encoder.transfer("ferritic_snapshot_atlas");
+                transfer.copy_buffer_to_texture(
+                    source,
+                    update.width,
+                    blade::TexturePiece {
+                        texture: state.atlas.texture,
+                        mip_level: 0,
+                        array_layer: 0,
+                        origin: [0, 0, 0],
+                    },
+                    blade::Extent {
+                        width: update.width,
+                        height: update.height,
+                        depth: 1,
+                    },
+                );
+            }
+        }
+
+        let batches = build_batches(scene, physical, scale);
+        {
+            let mut pass = encoder.render(
+                "ferritic_snapshot",
+                blade::RenderTargetSet {
+                    colors: &[blade::RenderTarget {
+                        view: state.view,
+                        init_op: blade::InitOp::Clear(blade::TextureColor::TransparentBlack),
+                        finish_op: blade::FinishOp::Store,
+                    }],
+                    depth_stencil: None,
+                },
+            );
+            draw_batches(
+                context,
+                &mut pass,
+                &mut state.belt,
+                &state.pipelines,
+                &state.atlas,
+                &batches,
+            );
+        }
+
+        {
+            let mut transfer = encoder.transfer("ferritic_snapshot_readback");
+            transfer.copy_texture_to_buffer(
+                state.texture.into(),
+                state.readback.into(),
+                physical_extent.width * 4,
+                physical_extent,
+            );
+        }
+
+        let sync = context.submit(encoder);
+        context
+            .wait_for(&sync, 120_000)
+            .map_err(|error| error.to_string())?;
+
+        let mut pixels = vec![0u8; state.byte_count as usize];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                state.readback.data(),
+                pixels.as_mut_ptr(),
+                state.byte_count as usize,
+            );
+        }
+
+        Ok(Snapshot {
+            width: physical_extent.width,
+            height: physical_extent.height,
+            pixels,
+        })
+    }
+
+    /// Releases the cached offscreen resources. Optional: dropping the device
+    /// releases them too.
+    pub fn destroy_offscreen(&mut self) {
+        if let Some(mut state) = self.offscreen.take() {
+            state.destroy(&self.context);
+        }
+    }
+}
+
 /// Renders a scene into an offscreen texture and reads it back.
+///
+/// Kept as a free function for the snapshot examples; windowed callers should
+/// call [`Gpu::render_offscreen`] directly and reuse the device.
 pub fn render_offscreen(
     gpu: &mut Gpu,
     logical_size: Size,
@@ -565,131 +798,7 @@ pub fn render_offscreen(
     scene: &Scene,
     atlas: Option<&AtlasUpdate>,
 ) -> Result<Snapshot, String> {
-    let physical = Size::new(logical_size.width * scale, logical_size.height * scale);
-    let physical_extent = extent(physical);
-    let format = blade::TextureFormat::Rgba8Unorm;
-
-    let Gpu {
-        context,
-        encoder,
-        previous_sync,
-    } = gpu;
-    let _ = previous_sync.take();
-
-    let texture = context.create_texture(blade::TextureDesc {
-        name: "ferritic_snapshot_target",
-        format,
-        size: physical_extent,
-        array_layer_count: 1,
-        mip_level_count: 1,
-        dimension: blade::TextureDimension::D2,
-        usage: blade::TextureUsage::TARGET | blade::TextureUsage::COPY,
-        sample_count: 1,
-        external: None,
-    });
-    let view = context.create_texture_view(
-        texture,
-        blade::TextureViewDesc {
-            name: "ferritic_snapshot_view",
-            format,
-            dimension: blade::ViewDimension::D2,
-            subresources: &blade::TextureSubresources::default(),
-        },
-    );
-    let byte_count = (physical_extent.width * physical_extent.height * 4) as u64;
-    let readback = context.create_buffer(blade::BufferDesc {
-        name: "ferritic_snapshot_readback",
-        size: byte_count,
-        memory: blade::Memory::Shared,
-    });
-
-    let mut pipelines = Pipelines::new(context, format);
-    let mut belt = new_belt();
-    let mut atlas_texture = AtlasTexture::new(context);
-
-    encoder.start();
-    encoder.init_texture(texture);
-    encoder.init_texture(atlas_texture.texture);
-    atlas_texture.initialized = true;
-
-    if let Some(update) = atlas {
-        atlas_texture.version = update.version;
-        let source = belt.alloc_bytes(&update.pixels, context);
-        {
-            let mut transfer = encoder.transfer("ferritic_snapshot_atlas");
-            transfer.copy_buffer_to_texture(
-                source,
-                update.width,
-                blade::TexturePiece {
-                    texture: atlas_texture.texture,
-                    mip_level: 0,
-                    array_layer: 0,
-                    origin: [0, 0, 0],
-                },
-                blade::Extent {
-                    width: update.width,
-                    height: update.height,
-                    depth: 1,
-                },
-            );
-        }
-    }
-
-    let batches = build_batches(scene, physical, scale);
-    {
-        let mut pass = encoder.render(
-            "ferritic_snapshot",
-            blade::RenderTargetSet {
-                colors: &[blade::RenderTarget {
-                    view,
-                    init_op: blade::InitOp::Clear(blade::TextureColor::TransparentBlack),
-                    finish_op: blade::FinishOp::Store,
-                }],
-                depth_stencil: None,
-            },
-        );
-        draw_batches(
-            context,
-            &mut pass,
-            &mut belt,
-            &pipelines,
-            &atlas_texture,
-            &batches,
-        );
-    }
-
-    {
-        let mut transfer = encoder.transfer("ferritic_snapshot_readback");
-        transfer.copy_texture_to_buffer(
-            texture.into(),
-            readback.into(),
-            physical_extent.width * 4,
-            physical_extent,
-        );
-    }
-
-    let sync = context.submit(encoder);
-    context
-        .wait_for(&sync, 120_000)
-        .map_err(|error| error.to_string())?;
-
-    let mut pixels = vec![0u8; byte_count as usize];
-    unsafe {
-        std::ptr::copy_nonoverlapping(readback.data(), pixels.as_mut_ptr(), byte_count as usize);
-    }
-
-    belt.destroy(context);
-    pipelines.destroy(context);
-    atlas_texture.destroy(context);
-    context.destroy_buffer(readback);
-    context.destroy_texture_view(view);
-    context.destroy_texture(texture);
-
-    Ok(Snapshot {
-        width: physical_extent.width,
-        height: physical_extent.height,
-        pixels,
-    })
+    gpu.render_offscreen(logical_size, scale, scene, atlas)
 }
 
 fn ndc(point: [f32; 2], size: Size) -> [f32; 2] {

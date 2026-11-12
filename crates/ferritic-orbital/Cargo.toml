@@ -4,10 +4,18 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Orbital (Redox) platform backend for FerriticUI, rendered by ferritic-soft"
+description = "Orbital (Redox) platform backend for FerriticUI, rendered by ferritic-soft or ferritic-blade"
+
+[features]
+default = []
+# Render through blade's Vulkan backend (Mesa/lavapipe on Redox) instead of the
+# CPU rasterizer. Selected at runtime with FERRITIC_RENDERER=blade; the CPU
+# renderer remains the fallback when Vulkan is unavailable.
+blade = ["dep:ferritic-blade"]
 
 [dependencies]
 ferritic-core.workspace = true
 ferritic-text.workspace = true
 ferritic-soft.workspace = true
+ferritic-blade = { workspace = true, optional = true }
 orbclient = "0.4"

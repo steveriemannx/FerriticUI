@@ -1,6 +1,5 @@
 branch: blade-ferritic
-revision: 4c7b6953cb91fb48b7028209dc6c15a43a323b8a
+revision: 025cf3580a26476d4e6a526ed3f96b40ab737e62
 repository: local ../blade (fork of https://github.com/kvark/blade)
-based-on: main 30c94eb + feat/d3d12-backend + feat/mit-licensed-deps
 d3d12: yes (blade-graphics feature "d3d12", Windows only; not wired into the HAL traits yet)
 license: MIT; see vendor/blade-ferritic/docs/licensing.md

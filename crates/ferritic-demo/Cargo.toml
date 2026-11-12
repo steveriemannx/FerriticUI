@@ -4,7 +4,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "FerriticUI counter demo for Redox (ferritic-orbital + ferritic-soft)"
+description = "FerriticUI counter demo for Redox (ferritic-orbital + ferritic-soft/ferritic-blade)"
+
+[features]
+default = []
+# Window rendering through blade's Vulkan backend (Mesa/lavapipe on Redox).
+# `--gpu` selects it at runtime; without the feature the flag is a no-op and
+# ferritic-soft renders.
+blade = ["ferritic-orbital/blade"]
 
 [[bin]]
 name = "ferritic-demo"

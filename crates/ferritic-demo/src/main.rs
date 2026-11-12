@@ -88,6 +88,12 @@ fn main() -> Result<(), String> {
     if std::env::args().any(|argument| argument == "--snapshot") {
         return snapshot(&theme);
     }
+    // `--gpu` opts the window loop into the ferritic-blade Vulkan backend when
+    // the crate is built with the `blade` feature; otherwise it falls back to
+    // ferritic-soft with a diagnostic.
+    if std::env::args().any(|argument| argument == "--gpu") {
+        std::env::set_var("FERRITIC_RENDERER", "blade");
+    }
     let options = WindowOptions {
         title: "FerriticUI: Counter".to_string(),
         width: 360,
